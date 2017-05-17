@@ -1,4 +1,4 @@
-update=Wed 26 Apr 2017 10:11:00 AM CEST
+update=Wed 17 May 2017 11:22:15 AM CEST
 version=1
 last_client=kicad
 [pcbnew]
@@ -59,3 +59,13 @@ LibName27=atmel
 LibName28=contrib
 LibName29=valves
 LibName30=/home/user/toys/7seg/hw/chibi/components
+[schematic_editor]
+version=1
+PageLayoutDescrFile=
+PlotDirectoryName=
+SubpartIdSeparator=0
+SubpartFirstId=65
+NetFmtName=
+SpiceForceRefPrefix=0
+SpiceUseNetNumbers=0
+LabSize=60

@@ -34,7 +34,7 @@ EELAYER 25 0
 EELAYER END
 $Descr A4 11693 8268
 encoding utf-8
-Sheet 2 3
+Sheet 3 3
 Title ""
 Date ""
 Rev ""
@@ -52,7 +52,7 @@ AR Path="/5901390A/5900990E" Ref="D14"  Part="1"
 AR Path="/59008B1D/5900990E" Ref="D10"  Part="1" 
 F 0 "D14" H 8100 2750 60  0000 C CNN
 F 1 "7seg_4digit_cc" H 7550 2450 60  0000 C CNN
-F 2 "Displays_7-Segment:Cx56-12" H 8550 2350 60  0001 C CNN
+F 2 "footprints:7seg_4digit_cc_modified" H 8550 2350 60  0001 C CNN
 F 3 "" H 8550 2350 60  0001 C CNN
 	1    7550 2450
 	1    0    0    -1  
@@ -65,7 +65,7 @@ AR Path="/5901390A/59009915" Ref="D15"  Part="1"
 AR Path="/59008B1D/59009915" Ref="D11"  Part="1" 
 F 0 "D15" H 7000 2750 60  0000 C CNN
 F 1 "7seg_4digit_cc" H 6450 2450 60  0000 C CNN
-F 2 "Displays_7-Segment:Cx56-12" H 7450 2350 60  0001 C CNN
+F 2 "footprints:7seg_4digit_cc_modified" H 7450 2350 60  0001 C CNN
 F 3 "" H 7450 2350 60  0001 C CNN
 	1    6450 2450
 	1    0    0    -1  
@@ -78,7 +78,7 @@ AR Path="/5901390A/5900991C" Ref="D16"  Part="1"
 AR Path="/59008B1D/5900991C" Ref="D12"  Part="1" 
 F 0 "D16" H 5900 2750 60  0000 C CNN
 F 1 "7seg_4digit_cc" H 5350 2450 60  0000 C CNN
-F 2 "Displays_7-Segment:Cx56-12" H 6350 2350 60  0001 C CNN
+F 2 "footprints:7seg_4digit_cc_modified" H 6350 2350 60  0001 C CNN
 F 3 "" H 6350 2350 60  0001 C CNN
 	1    5350 2450
 	1    0    0    -1  
@@ -91,7 +91,7 @@ AR Path="/5901390A/59009923" Ref="D17"  Part="1"
 AR Path="/59008B1D/59009923" Ref="D13"  Part="1" 
 F 0 "D17" H 4800 2750 60  0000 C CNN
 F 1 "7seg_4digit_cc" H 4250 2450 60  0000 C CNN
-F 2 "Displays_7-Segment:Cx56-12" H 5250 2350 60  0001 C CNN
+F 2 "footprints:7seg_4digit_cc_modified" H 5250 2350 60  0001 C CNN
 F 3 "" H 5250 2350 60  0001 C CNN
 	1    4250 2450
 	1    0    0    -1  
@@ -104,7 +104,7 @@ AR Path="/5901390A/5900992A" Ref="U9"  Part="1"
 AR Path="/59008B1D/5900992A" Ref="U8"  Part="1" 
 F 0 "U9" H 6600 4950 60  0000 C CNN
 F 1 "MBI5026" H 5900 4550 60  0000 C CNN
-F 2 "footprints:SSOP24-1.0" H 5900 4550 60  0001 C CNN
+F 2 "footprints:SSOP24-1.0-nosilk" H 5900 4550 60  0001 C CNN
 F 3 "" H 5900 4550 60  0001 C CNN
 	1    5900 4550
 	1    0    0    1   
