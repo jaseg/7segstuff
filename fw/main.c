@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <system_stm32f0xx.h>
 #include <stm32f0xx_ll_utils.h>
+#include <stm32f0xx_ll_spi.h>
 #include <string.h>
 #include <unistd.h>
 /* 
@@ -14,12 +15,30 @@ void tick(void) {
         __asm__("nop");
 }
 
+void spi_send(int data) {
+    SPI1->DR = data;
+    while (SPI1->SR & SPI_SR_BSY);
+}
+
+void strobe_aux(void) {
+    GPIOA->BSRR = GPIO_BSRR_BS_10;
+    tick();
+    GPIOA->BSRR = GPIO_BSRR_BR_10;
+}
+
+void strobe_leds(void) {
+    GPIOA->BSRR = GPIO_BSRR_BS_9;
+    tick();
+    GPIOA->BSRR = GPIO_BSRR_BR_9;
+}
+
 int main(void) {
     RCC->CR |= RCC_CR_HSEON;
     while (!(RCC->CR&RCC_CR_HSERDY));
     RCC->CFGR &= ~RCC_CFGR_PLLMUL_Msk & ~RCC_CFGR_SW_Msk;
     RCC->CFGR |= (2<<RCC_CFGR_PLLMUL_Pos) | RCC_CFGR_PLLSRC_HSE_PREDIV; /* PLL x4 */
-    RCC->CFGR2 &= ~RCC_CFGR2_PREDIV_Msk; /* PREDIV=0 */
+    RCC->CFGR2 &= ~RCC_CFGR2_PREDIV_Msk;
+    RCC->CFGR2 |= RCC_CFGR2_PREDIV_DIV2;
     RCC->CR |= RCC_CR_PLLON;
     while (!(RCC->CR&RCC_CR_PLLRDY));
     RCC->CFGR |= (2<<RCC_CFGR_SW_Pos);
@@ -32,50 +51,55 @@ int main(void) {
 
     GPIOA->MODER |=
           (2<<GPIO_MODER_MODER5_Pos)  /* PA5  - SCLK */
+        | (1<<GPIO_MODER_MODER6_Pos)  /* PA6  - LED !OE */
         | (2<<GPIO_MODER_MODER7_Pos)  /* PA7  - MOSI */
         | (1<<GPIO_MODER_MODER9_Pos)  /* PA9  - LED strobe */
         | (1<<GPIO_MODER_MODER10_Pos);/* PA10 - Auxiliary strobe */
 
     /* Set shift register IO GPIO output speed */
     GPIOA->OSPEEDR |=
-          (3<<GPIO_OSPEEDR_OSPEEDR5_Pos)   /* SCLK   */
-        | (3<<GPIO_OSPEEDR_OSPEEDR7_Pos)   /* MOSI   */
-        | (3<<GPIO_OSPEEDR_OSPEEDR9_Pos)   /* LED strobe   */
-        | (3<<GPIO_OSPEEDR_OSPEEDR10_Pos); /* Auxiliary strobe   */
+          (2<<GPIO_OSPEEDR_OSPEEDR5_Pos)   /* SCLK   FIXME maybe try 0x2 here? */
+        | (2<<GPIO_OSPEEDR_OSPEEDR6_Pos)   /* LED !OE   */
+        | (2<<GPIO_OSPEEDR_OSPEEDR7_Pos)   /* MOSI */
+        | (2<<GPIO_OSPEEDR_OSPEEDR9_Pos)   /* LED strobe */
+        | (2<<GPIO_OSPEEDR_OSPEEDR10_Pos); /* Auxiliary strobe */
 
     GPIOA->AFR[0] |=
           (0<<GPIO_AFRL_AFRL5_Pos)   /* SPI1_SCK  */
         | (0<<GPIO_AFRL_AFRL7_Pos);  /* SPI1_MOSI */
 
     /* Configure SPI controller */
-    SPI1->CR1 = SPI_CR1_SSM | SPI_CR1_SSI | SPI_CR1_SPE | (7<<SPI_CR1_BR_Pos) | SPI_CR1_MSTR;
-    SPI1->CR2 = (7<<SPI_CR2_DS_Pos);
+    SPI1->I2SCFGR = 0;
+    SPI1->CR2 &= ~SPI_CR2_DS_Msk;
+    SPI1->CR2 &= ~SPI_CR2_DS_Msk;
+    SPI1->CR2 |= LL_SPI_DATAWIDTH_16BIT;
+    /* FIXME maybe try w/o BIDI */
+    SPI1->CR1 = SPI_CR1_BIDIMODE | SPI_CR1_BIDIOE | SPI_CR1_SSM | SPI_CR1_SSI | SPI_CR1_SPE | (1<<SPI_CR1_BR_Pos) | SPI_CR1_MSTR | SPI_CR1_CPOL | SPI_CR1_CPHA;
 
-    int pos1 = 0;
-    int pos2 = 0;
-
+    int i = 0;
+    int val = 0x5555;
+    GPIOA->BSRR = GPIO_BSRR_BR_6;
     while (42) {
-        for (int i=0; i<6; i++) {
-            if (pos1 == i) {
-                SPI1->DR = 1<<pos2;
-            } else {
-                SPI1->DR = 0;
-            }
-            while (SPI1->SR & SPI_SR_BSY);
-            tick();
+        if (i == 8) {
+            i = 0;
+            val = ~val;
         }
-        pos2 += 1;
-        if (pos2 == 8) {
-            pos2 = 0;
-            pos1 += 1;
-            if (pos1 == 6)
-                pos1 = 0;
+        spi_send((i&1 ? 0xfa00 : 0xf000) | (0xff^(1<<i)));
+        i++; // 1100'0100"0000'0000
+        strobe_aux();
+
+        spi_send(val);
+        spi_send(val);
+        strobe_leds();
+        /*if (i == 32) {
+            i = 0;
         }
-        /* Strobe both LED drivers and aux regs */
-        GPIOA->BSRR = GPIO_BSRR_BS_9 | GPIO_BSRR_BS_10;
-        tick();
-        GPIOA->BSRR = GPIO_BSRR_BR_9 | GPIO_BSRR_BR_10;
-        LL_mDelay(1);
+        i++;
+        spi_send((i&16) ? 0 : (1<<i));
+        spi_send((i&16) ? (1<<(i&15)) : 0);
+        strobe_leds();
+        */
+        LL_mDelay(200);
     }
 }
 
