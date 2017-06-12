@@ -74,32 +74,32 @@ int main(void) {
     SPI1->CR2 &= ~SPI_CR2_DS_Msk;
     SPI1->CR2 |= LL_SPI_DATAWIDTH_16BIT;
     /* FIXME maybe try w/o BIDI */
-    SPI1->CR1 = SPI_CR1_BIDIMODE | SPI_CR1_BIDIOE | SPI_CR1_SSM | SPI_CR1_SSI | SPI_CR1_SPE | (1<<SPI_CR1_BR_Pos) | SPI_CR1_MSTR | SPI_CR1_CPOL | SPI_CR1_CPHA;
+    SPI1->CR1 = SPI_CR1_BIDIMODE | SPI_CR1_BIDIOE | SPI_CR1_SSM | SPI_CR1_SSI | SPI_CR1_SPE | (0<<SPI_CR1_BR_Pos) | SPI_CR1_MSTR | SPI_CR1_CPOL | SPI_CR1_CPHA;
 
-    int i = 0;
-    int val = 0x5555;
+    int val = 0xffff;
     GPIOA->BSRR = GPIO_BSRR_BR_6;
+    int j = 0;
+    int bval = 0x4000;
     while (42) {
-        if (i == 8) {
-            i = 0;
-            val = ~val;
+        for (int i=0; i<8; i++) {
+            spi_send(val);
+            spi_send(val);
+            strobe_leds();
+            spi_send(0x0200 | bval | (0xff^(1<<i)));
+            strobe_aux();
+            for(int i=0; i<10; i++)
+                tick();
+            //j++;
+            if (j == 1000) {
+                j = 0;
+                if (bval == 0x4000)
+                    bval = 0x8000;
+                else if (bval == 0x8000)
+                    bval = 0x0000;
+                else
+                    bval = 0x4000;
+            }
         }
-        spi_send((i&1 ? 0xfa00 : 0xf000) | (0xff^(1<<i)));
-        i++; // 1100'0100"0000'0000
-        strobe_aux();
-
-        spi_send(val);
-        spi_send(val);
-        strobe_leds();
-        /*if (i == 32) {
-            i = 0;
-        }
-        i++;
-        spi_send((i&16) ? 0 : (1<<i));
-        spi_send((i&16) ? (1<<(i&15)) : 0);
-        strobe_leds();
-        */
-        LL_mDelay(200);
     }
 }
 
