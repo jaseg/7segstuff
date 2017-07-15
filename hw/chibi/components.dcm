@@ -8,4 +8,12 @@ $CMP 74HC595_mine
 F ref/74HC_HCT595.pdf
 $ENDCMP
 #
+$CMP 74HCT125
+F ref/74HC_HCT595.pdf
+$ENDCMP
+#
+$CMP 74HCT125_mine
+F ref/74HC_HCT595.pdf
+$ENDCMP
+#
 #End Doc Library
