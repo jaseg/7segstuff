@@ -3,7 +3,7 @@
   (general
     (links 279)
     (no_connects 0)
-    (area 47.31886 39.765768 160.611476 125.705685)
+    (area 44.876376 39.765768 160.611476 125.705685)
     (thickness 1.6)
     (drawings 33)
     (tracks 2272)
@@ -14,16 +14,16 @@
 
   (page A4)
   (layers
-    (0 F.Cu signal)
-    (31 B.Cu signal hide)
+    (0 F.Cu signal hide)
+    (31 B.Cu signal)
     (32 B.Adhes user hide)
     (33 F.Adhes user hide)
     (34 B.Paste user hide)
     (35 F.Paste user hide)
-    (36 B.SilkS user hide)
-    (37 F.SilkS user)
-    (38 B.Mask user hide)
-    (39 F.Mask user)
+    (36 B.SilkS user)
+    (37 F.SilkS user hide)
+    (38 B.Mask user)
+    (39 F.Mask user hide)
     (40 Dwgs.User user hide)
     (41 Cmts.User user hide)
     (42 Eco1.User user hide)
@@ -37,7 +37,7 @@
   )
 
   (setup
-    (last_trace_width 2)
+    (last_trace_width 0.25)
     (user_trace_width 0.254)
     (user_trace_width 0.35)
     (user_trace_width 0.5)
@@ -71,7 +71,7 @@
     (pad_drill 0.9)
     (pad_to_mask_clearance 0.2)
     (aux_axis_origin 0 0)
-    (visible_elements FFFEFB7F)
+    (visible_elements FFFEFD7F)
     (pcbplotparams
       (layerselection 0x010fc_80000001)
       (usegerberextensions false)
@@ -3293,15 +3293,15 @@
     (pad 2 smd rect (at 1.84912 1.14808 90) (size 1.89992 1.09982) (layers F.Cu F.Paste F.Mask))
   )
 
-  (module footprints:megumin locked (layer B.Cu) (tedit 590B0C79) (tstamp 596E6186)
-    (at 99.822 82.55 180)
+  (module footprints:megumin (layer B.Cu) (tedit 590B0C79) (tstamp 596E6186)
+    (at 98.044 78.486)
     (descr "Imported from megumin_kicad.svg")
     (tags svg2mod)
     (attr smd)
-    (fp_text reference svg2mod (at 0 36.065404 180) (layer B.SilkS) hide
+    (fp_text reference svg2mod (at 0 36.065404) (layer B.SilkS) hide
       (effects (font (thickness 0.3048)) (justify mirror))
     )
-    (fp_text value G*** (at 0 -36.065404 180) (layer B.SilkS) hide
+    (fp_text value G*** (at 0 -36.065404) (layer B.SilkS) hide
       (effects (font (thickness 0.3048)) (justify mirror))
     )
     (fp_poly (pts (xy -11.485678 -13.085707) (xy -11.486601 -13.107321) (xy -11.487519 -13.128913) (xy -11.488431 -13.150484)
