@@ -32,6 +32,11 @@ void strobe_leds(void) {
     GPIOA->BSRR = GPIO_BSRR_BR_9;
 }
 
+#define SR_COMM      0x0002
+#define SR_ERROR     0x0004
+#define SR_ID        0x0008
+#define SR_ILED_HIGH 0x0080
+#define SR_ILED_LOW  0x0040
 int main(void) {
     RCC->CR |= RCC_CR_HSEON;
     while (!(RCC->CR&RCC_CR_HSERDY));
@@ -77,27 +82,55 @@ int main(void) {
     SPI1->CR1 = SPI_CR1_BIDIMODE | SPI_CR1_BIDIOE | SPI_CR1_SSM | SPI_CR1_SSI | SPI_CR1_SPE | (0<<SPI_CR1_BR_Pos) | SPI_CR1_MSTR | SPI_CR1_CPOL | SPI_CR1_CPHA;
 
     int val = 0xffff;
-    GPIOA->BSRR = GPIO_BSRR_BR_6;
+    int aval = 0x0000;
+    GPIOA->BSRR = GPIO_BSRR_BR_6; /* OE */
     int j = 0;
-    int bval = 0x4000;
+    int ctr = 0;
+    int q = 0;
+    int bval = 0x400;
     while (42) {
         for (int i=0; i<8; i++) {
-            spi_send(val);
-            spi_send(val);
+            spi_send(1<<(ctr&3));
+            spi_send(1<<((ctr>>1)&3));
             strobe_leds();
-            spi_send(0x0200 | bval | (0xff^(1<<i)));
+            //spi_send(0x0200 | bval | (0xff^(1<<i)));
+            //spi_send((0xff^(1<<i))<<8);
+            //spi_send(SR_COMM | SR_ILED_HIGH | 0xff);
+            //spi_send(0x00ff ^ (1<<ctr) | (0x100<<ctr));
+            spi_send(bval | (0xff00 ^ (0x100<<i)));
             strobe_aux();
             for(int i=0; i<10; i++)
                 tick();
-            //j++;
+            j++;
             if (j == 1000) {
                 j = 0;
-                if (bval == 0x4000)
-                    bval = 0x8000;
-                else if (bval == 0x8000)
-                    bval = 0x0000;
-                else
-                    bval = 0x4000;
+                ctr++;
+                if (ctr == 8) {
+                    ctr = 0;
+                    q++;
+                    if (q == 6)
+                        q = 0;
+                }
+                switch (q) {
+                    case 0:
+                        bval = SR_COMM  | SR_ILED_LOW;
+                        break;
+                    case 1:
+                        bval = SR_ID    | SR_ILED_LOW;
+                        break;
+                    case 2:
+                        bval = SR_ERROR | SR_ILED_LOW;
+                        break;
+                    case 3:
+                        bval = SR_COMM  | SR_ILED_HIGH;
+                        break;
+                    case 4:
+                        bval = SR_ID    | SR_ILED_HIGH;
+                        break;
+                    case 5:
+                        bval = SR_ERROR | SR_ILED_HIGH;
+                        break;
+                }
             }
         }
     }
