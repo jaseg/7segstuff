@@ -9,20 +9,20 @@ OBJCOPY := arm-none-eabi-objcopy
 OBJDUMP := arm-none-eabi-objdump
 SIZE    := arm-none-eabi-size
 
-CFLAGS  = -Wall -std=gnu11 -Os -fdump-rtl-expand
+CFLAGS  = -g -Wall -std=gnu11 -O0 -fdump-rtl-expand
 CFLAGS += -mlittle-endian -mcpu=cortex-m0 -march=armv6-m -mthumb
-CFLAGS += -ffunction-sections -fdata-sections
+#CFLAGS += -ffunction-sections -fdata-sections
 LDFLAGS = -nostartfiles
 #LDFLAGS += -specs=rdimon.specs -DSEMIHOSTING
 LDFLAGS += -Wl,-Map=main.map -nostdlib
-LDFLAGS += -Wl,--gc-sections 
+#LDFLAGS += -Wl,--gc-sections 
 LIBS = -lgcc
 #LIBS += -lrdimon
 
 # Technically we're using an STM32F030F4, but apart from the TSSOP20 package that one is largely identical to the
 # STM32F030*6 and there is no separate device header provided for it, so we're faking a *6 device here. This is
 # even documented in stm32f0xx.h. Thanks ST!
-CFLAGS += -DSTM32F030x6
+CFLAGS += -DSTM32F030x6 -DHSE_VALUE=25000000
 
 LDFLAGS += -Tstm32_flash.ld
 CFLAGS += -I$(CMSIS_DEV_PATH)/Include -I$(CMSIS_PATH)/Include -I$(HAL_PATH)/Inc -Iconfig
@@ -36,9 +36,11 @@ all: main.elf main.pdf
 
 %.o: %.c
 	$(CC) -c $(CFLAGS) -o $@ $^
+	$(CC) -E $(CFLAGS) -o $(@:.o=.pp) $^
 
 %.o: %.s
 	$(CC) -c $(CFLAGS) -o $@ $^
+	$(CC) -E $(CFLAGS) -o $(@:.o=.pp) $^
 
 %.dot: %.elf
 	r2 -a arm -qc 'aa;agC' $< 2>/dev/null >$@
