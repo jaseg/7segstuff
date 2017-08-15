@@ -245,12 +245,13 @@ int main(void) {
     RCC->CFGR |= (2<<RCC_CFGR_SW_Pos);
     SystemCoreClockUpdate();
 
-    SysTick_Config(SystemCoreClock/1000); /* 1ms interval */
-    NVIC_DisableIRQ(SysTick_IRQn);
+    //SysTick_Config(SystemCoreClock/1000); /* 1ms interval */
+    //NVIC_DisableIRQ(SysTick_IRQn);
+    SysTick->VAL = 0U;
+    SysTick->LOAD = 0x00FFFFFF;
+    SysTick->CTRL = SysTick_CTRL_CLKSOURCE_Msk | SysTick_CTRL_ENABLE_Msk;
     while (42) {
-        static int tick __attribute__((used));
-        static int cvr __attribute__((used));
-        tick = sys_time;
+        static unsigned int cvr __attribute__((used));
         cvr = SysTick->VAL;
         //if (fb_op == FB_FORMAT) {
             transpose_data(rx_buf, write_fb);
@@ -259,8 +260,7 @@ int main(void) {
         //    while (fb_op == FB_UPDATE)
         //        ;
         //}
-        tick = sys_time - tick;
-        cvr = SysTick->VAL - cvr;
+        cvr = cvr -  SysTick->VAL;
         asm volatile ("bkpt");
     }
     //LL_Init1msTick(SystemCoreClock);
