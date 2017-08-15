@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
+
 /* 
  * Part number: STM32F030F4C6
  */
@@ -53,7 +54,14 @@ enum {
 };
 struct framebuf {
     /* Multiplexing order: first Digits, then Time/bits, last Segments */
-    uint32_t data[nbits*frame_size_words];
+    union {
+        uint32_t data[nbits*frame_size_words];
+        struct {
+            struct {
+                uint32_t data[frame_size_words];
+            } frame[nbits];
+        };
+    };
     uint8_t brightness; /* 0 or 1; controls global brighntess control */
 };
 
@@ -79,15 +87,35 @@ void transpose_data(volatile uint8_t *rx_buf, volatile struct framebuf *out_fb) 
         };
         union {
             uint16_t low;
-            struct { uint8_t al:2, bl:2, cl:2, dl:2, el:2, fl:2, gl:2, dpl:2; };
+            struct { uint8_t dpl:2, gl:2, fl:2, el:2, dl:2, cl:2, bl:2, al:2; };
         };
     };
     struct data_format *rxp = (struct data_format *)rx_buf;
-    for (int bit=0; bit<8; bit++) {
-        for (int seg=0; seg<8; seg++) {
+    for (int bit=0; bit<8; bit++) { /* bits */
+        uint32_t bit_mask = 1U<<bit;
+        volatile uint32_t *frame_data = out_fb->frame[bit+2].data;
+        uint8_t *start_inp = rxp->high;
+        for (volatile uint32_t *outp=frame_data; outp<frame_data+8; outp++) { /* segments */
+            uint32_t acc = 0;
+            uint8_t *inp = start_inp++;
             for (int digit=0; digit<32; digit++) {
-                out_fb[(bit+2)*frame_size_words + seg] |= !!(rxp[digit].high[seg] & (1<<bit)) << digit;
+                acc |= (*inp & bit_mask) >> bit << digit;
+                inp += sizeof(struct data_format);
             }
+            *outp = acc;
+        }
+    }
+    for (int bit=0; bit<2; bit++) { /* bits */
+        volatile uint32_t *frame_data = out_fb->frame[bit].data;
+        uint16_t *inp = &rxp->low;
+        for (int seg=0; seg<8; seg++) { /* segments */
+            uint32_t mask = 1 << bit << seg;
+            uint32_t acc = 0;
+            for (int digit=0; digit<32; digit++) {
+                acc |= (*inp & mask) >> bit >> seg << digit;
+                inp += sizeof(struct data_format)/sizeof(uint16_t);
+            }
+            frame_data[seg] = acc;
         }
     }
 }
@@ -156,7 +184,7 @@ void TIM3_IRQHandler() {
     //TIM3->CR1 &= ~TIM_CR1_CEN_Msk; FIXME
 
     /* This takes about 10us */
-    int period = shift_data();
+    int period = 0; /* FIXME DEBUG shift_data(); */
     TIM3->CCR1 = period;
     TIM3->CNT = 0xffff; /* To not enable OC1 right away */
 
@@ -217,7 +245,25 @@ int main(void) {
     RCC->CFGR |= (2<<RCC_CFGR_SW_Pos);
     SystemCoreClockUpdate();
 
-    LL_Init1msTick(SystemCoreClock);
+    SysTick_Config(SystemCoreClock/1000); /* 1ms interval */
+    NVIC_DisableIRQ(SysTick_IRQn);
+    while (42) {
+        static int tick __attribute__((used));
+        static int cvr __attribute__((used));
+        tick = sys_time;
+        cvr = SysTick->VAL;
+        //if (fb_op == FB_FORMAT) {
+            transpose_data(rx_buf, write_fb);
+            write_fb->brightness = rx_buf[offsetof(struct framebuf, brightness)];
+        //    fb_op = FB_UPDATE;
+        //    while (fb_op == FB_UPDATE)
+        //        ;
+        //}
+        tick = sys_time - tick;
+        cvr = SysTick->VAL - cvr;
+        asm volatile ("bkpt");
+    }
+    //LL_Init1msTick(SystemCoreClock);
 
     RCC->AHBENR  |= RCC_AHBENR_GPIOAEN | RCC_AHBENR_DMAEN;
     RCC->APB2ENR |= RCC_APB2ENR_SPI1EN | RCC_APB2ENR_USART1EN;
@@ -316,26 +362,20 @@ int main(void) {
 
     NVIC_EnableIRQ(TIM3_IRQn);
     NVIC_SetPriority(TIM3_IRQn, 2);
-
+ 
     SysTick_Config(SystemCoreClock/1000); /* 1ms interval */
 
     while (42) {
         led_state = (sys_time>>8)&7;
-
-        if (fb_op == FB_FORMAT) {
-            transpose_data(rx_buf, read_fb);
-            fb_op = FB_UPDATE;
-            while (fb_op == FB_UPDATE)
-                ;
-        }
     }
 }
 
 void NMI_Handler(void) {
 }
 
-void HardFault_Handler(void) {
-    for(;;);
+void HardFault_Handler(void) __attribute__((naked));
+void HardFault_Handler() {
+    asm volatile ("bkpt");
 }
 
 void SVC_Handler(void) {

@@ -7,10 +7,11 @@ void *_impure_ptr = NULL;
 void __sinit(void) {
 }
 
-void memset(void *s, int c, size_t n) {
+void *memset(void *s, int c, size_t n) {
     char *end = (char *)s + n;
     for (char *p = (char *)s; p < end; p++)
         *p = (char)c;
+    return s;
 }
 
 size_t strlen(const char *s) {
