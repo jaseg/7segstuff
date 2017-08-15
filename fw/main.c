@@ -54,19 +54,49 @@ enum {
 struct framebuf {
     /* Multiplexing order: first Digits, then Time/bits, last Segments */
     uint32_t data[nbits*frame_size_words];
-    int brightness; /* 0 or 1; controls global brighntess control */
+    uint8_t brightness; /* 0 or 1; controls global brighntess control */
 };
 
-struct framebuf fb[2] = {0};
-struct framebuf *read_fb=fb+0, *write_fb=fb+1;
+volatile struct framebuf fb[2] = {0};
+volatile struct framebuf *read_fb=fb+0, *write_fb=fb+1;
 volatile int led_state = 0;
-volatile enum { FB_WRITE, FB_UPDATE } fb_op;
+volatile enum { FB_WRITE, FB_FORMAT, FB_UPDATE } fb_op;
+volatile uint8_t rx_buf[sizeof(struct framebuf)];
+volatile uint8_t this_addr = 0x05; /* FIXME */
 
 #define LED_COMM     0x0001
 #define LED_ERROR    0x0002
 #define LED_ID       0x0004
 #define SR_ILED_HIGH 0x0080
 #define SR_ILED_LOW  0x0040
+
+void transpose_data(volatile uint8_t *rx_buf, volatile struct framebuf *out_fb) {
+    memset((uint8_t *)out_fb, 0, sizeof(*out_fb));
+    struct data_format {
+        union {
+            uint8_t high[8];
+            struct { uint8_t ah, bh, ch, dh, eh, fh, gh, dph; };
+        };
+        union {
+            uint16_t low;
+            struct { uint8_t al:2, bl:2, cl:2, dl:2, el:2, fl:2, gl:2, dpl:2; };
+        };
+    };
+    struct data_format *rxp = (struct data_format *)rx_buf;
+    for (unsigned int digit=0; digit<nrows*ncols; digit++, rxp++) {
+        for (int segment=0; segment<8; segment++) {
+            uint32_t *outp = out_fb->data;
+            for (int bit=0x80; bit; bit>>=1, outp+=frame_size_words)
+                outp[segment] |= !!(rxp->high[segment] & bit) << digit;
+        }
+        uint16_t low = rxp->low;
+        for (int segment=0; segment<8; segment++) {
+            uint32_t *outp = out_fb->data;
+            for (int bit=0x8000; bit; bit>>=1, outp+=frame_size_words)
+                outp[segment] |= !!(rxp->high[segment] & bit) << digit;
+        }
+    }
+}
 
 void shift_aux(int global_current, int leds, int active_segment) {
     spi_send(
@@ -96,7 +126,7 @@ int shift_data() {
             frame_duration = time - last_frame_sys_time;
             last_frame_sys_time = sys_time;
             if (fb_op == FB_UPDATE) {
-                struct framebuf *tmp = read_fb;
+                volatile struct framebuf *tmp = read_fb;
                 read_fb = write_fb;
                 write_fb = tmp;
                 fb_op = FB_WRITE;
@@ -129,19 +159,56 @@ void cfg_timer3() {
 TIM_TypeDef *tim3 = TIM3;
 
 void TIM3_IRQHandler() {
-    //TIM3->CR1 &= ~TIM_CR1_CEN_Msk;
+    //TIM3->CR1 &= ~TIM_CR1_CEN_Msk; FIXME
 
-    static int last_ivl;
-    last_ivl = TIM3->CNT;
     /* This takes about 10us */
     int period = shift_data();
-    static int ivl;
-    ivl = TIM3->CNT - last_ivl;
     TIM3->CCR1 = period;
     TIM3->CNT = 0xffff; /* To not enable OC1 right away */
 
     TIM3->SR &= ~TIM_SR_CC1IF_Msk;
     //TIM3->CR1 |= TIM_CR1_CEN;
+}
+
+enum Command {
+    CMD_PING,
+    CMD_SET_ADDR,
+    CMD_SET_FB,
+    CMD_GET_DESC,
+};
+
+void USART1_IRQHandler() {
+    int addr = USART1->RDR;
+    int cmd = addr>>5;
+    addr &= 0x1F;
+    /* Are we addressed? */
+    if (addr != this_addr) {
+        /* We are not. Mute USART until next idle condition */
+        USART1->RQR |= USART_RQR_MMRQ;
+    } else {
+        /* We are. Switch by command. */
+        switch (cmd) {
+        case CMD_SET_FB:
+            /* Are we ready to process new frame data? */
+            if (fb_op != FB_WRITE)
+                goto errout; /* Error: Not yet ready to receive new packet */
+            /* Disable this RX interrupt for duration of DMA transfer */
+            USART1->CR1 &= ~USART_CR1_RXNEIE_Msk;
+            /* Enable DMA transfer to write buffer */
+            DMA1_Channel3->CCR |= DMA_CCR_EN;
+            /* Kick off formatting code in main loop outside interrupt context */
+            fb_op = FB_FORMAT;
+            break;
+        }
+    }
+errout:
+    /* FIXME */
+    return;
+}
+
+void DMA1_Channel2_3_IRQHandler() {
+    /* DMA Transfer complete, re-enable receive interrupt */
+    USART1->CR1 |= USART_CR1_RXNEIE;
 }
 
 int main(void) {
@@ -158,12 +225,15 @@ int main(void) {
 
     LL_Init1msTick(SystemCoreClock);
 
-    RCC->AHBENR  |= RCC_AHBENR_GPIOAEN;
-    RCC->APB2ENR |= RCC_APB2ENR_SPI1EN;
+    RCC->AHBENR  |= RCC_AHBENR_GPIOAEN | RCC_AHBENR_DMAEN;
+    RCC->APB2ENR |= RCC_APB2ENR_SPI1EN | RCC_APB2ENR_USART1EN;
     RCC->APB1ENR |= RCC_APB1ENR_TIM3EN;
 
     GPIOA->MODER |=
-          (2<<GPIO_MODER_MODER5_Pos)  /* PA5  - SCLK */
+          (2<<GPIO_MODER_MODER1_Pos)  /* PA1  - RS485 DE */
+        | (2<<GPIO_MODER_MODER2_Pos)  /* PA2  - RS485 TX */
+        | (2<<GPIO_MODER_MODER3_Pos)  /* PA3  - RS485 RX */
+        | (2<<GPIO_MODER_MODER5_Pos)  /* PA5  - SCLK */
         | (2<<GPIO_MODER_MODER6_Pos)  /* PA6  - LED !OE */
         | (2<<GPIO_MODER_MODER7_Pos)  /* PA7  - MOSI */
         | (1<<GPIO_MODER_MODER9_Pos)  /* PA9  - LED strobe */
@@ -171,25 +241,78 @@ int main(void) {
 
     /* Set shift register IO GPIO output speed */
     GPIOA->OSPEEDR |=
-          (2<<GPIO_OSPEEDR_OSPEEDR5_Pos)   /* SCLK   FIXME maybe try 0x2 here? */
+          (2<<GPIO_OSPEEDR_OSPEEDR1_Pos)   /* RS485 DE */
+        | (2<<GPIO_OSPEEDR_OSPEEDR2_Pos)   /* TX */
+        | (2<<GPIO_OSPEEDR_OSPEEDR3_Pos)   /* RX */
+        | (2<<GPIO_OSPEEDR_OSPEEDR5_Pos)   /* SCLK */
         | (2<<GPIO_OSPEEDR_OSPEEDR6_Pos)   /* LED !OE   */
         | (2<<GPIO_OSPEEDR_OSPEEDR7_Pos)   /* MOSI */
         | (2<<GPIO_OSPEEDR_OSPEEDR9_Pos)   /* LED strobe */
         | (2<<GPIO_OSPEEDR_OSPEEDR10_Pos); /* Auxiliary strobe */
 
     GPIOA->AFR[0] |=
-          (0<<GPIO_AFRL_AFRL5_Pos)   /* SPI1_SCK  */
-        | (1<<GPIO_AFRL_AFRL6_Pos)   /* TIM3_CH1  */
+          (1<<GPIO_AFRL_AFRL1_Pos)   /* USART1_RTS (DE) */
+        | (1<<GPIO_AFRL_AFRL2_Pos)   /* USART1_TX */
+        | (1<<GPIO_AFRL_AFRL3_Pos)   /* USART1_RX */
+        | (0<<GPIO_AFRL_AFRL5_Pos)   /* SPI1_SCK */
+        | (1<<GPIO_AFRL_AFRL6_Pos)   /* TIM3_CH1 */
         | (0<<GPIO_AFRL_AFRL7_Pos);  /* SPI1_MOSI */
+
+    GPIOA->PUPDR |=
+          (2<<GPIO_PUPDR_PUPDR1_Pos)  /* RS485 DE: Pulldown */
+        | (1<<GPIO_PUPDR_PUPDR2_Pos)  /* TX */
+        | (1<<GPIO_PUPDR_PUPDR3_Pos); /* RX */
 
     /* Configure SPI controller */
     SPI1->I2SCFGR = 0;
     SPI1->CR2 &= ~SPI_CR2_DS_Msk;
     SPI1->CR2 &= ~SPI_CR2_DS_Msk;
     SPI1->CR2 |= LL_SPI_DATAWIDTH_16BIT;
-    /* FIXME maybe try w/o BIDI */
+
+    /* Configure USART1 */
+    USART1->CR1 = /* 8-bit -> M1, M0 clear */
+        /* RTOIE clear */
+          (8 << USART_CR1_DEAT_Pos) /* 8 sample cycles/1 bit DE assertion time */
+        | (8 << USART_CR1_DEDT_Pos) /* 8 sample cycles/1 bit DE assertion time */
+        | USART_CR1_OVER8
+        /* CMIF clear */
+        | USART_CR1_MME
+        /* WAKE clear */
+        /* PCE, PS clear */
+        | USART_CR1_RXNEIE
+        /* other interrupts clear */
+        | USART_CR1_TE
+        | USART_CR1_RE;
+    //USART1->CR2 = USART_CR2_RTOEN; /* Timeout enable */
+    USART1->CR3 = USART_CR3_DEM; /* RS485 DE enable (output on RTS) */
+    int usartdiv = 25;
+    USART1->BRR = (usartdiv&0xFFF0) | ((usartdiv>>1) & 0x7);
+    USART1->CR1 |= USART_CR1_UE;
+
+    /* Configure DMA for USART frame data reception */
+    USART1->CR3 |= USART_CR3_DMAR;
+    DMA1_Channel3->CPAR = (unsigned int)&USART1->RDR;
+    DMA1_Channel3->CMAR = (unsigned int)rx_buf;
+    DMA1_Channel3->CNDTR = sizeof(rx_buf);
+    DMA1_Channel3->CCR = (0<<DMA_CCR_PL_Pos);
+    DMA1_Channel3->CCR |=
+          (0<<DMA_CCR_MSIZE_Pos)
+        | (0<<DMA_CCR_PSIZE_Pos)
+        | DMA_CCR_MINC
+        | DMA_CCR_TCIE;
+
     /* Baud rate PCLK/2 -> 25MHz */
-    SPI1->CR1 = SPI_CR1_BIDIMODE | SPI_CR1_BIDIOE | SPI_CR1_SSM | SPI_CR1_SSI | SPI_CR1_SPE | (0<<SPI_CR1_BR_Pos) | SPI_CR1_MSTR | SPI_CR1_CPOL | SPI_CR1_CPHA;
+    SPI1->CR1 =
+          SPI_CR1_BIDIMODE
+        | SPI_CR1_BIDIOE
+        | SPI_CR1_SSM
+        | SPI_CR1_SSI
+        | SPI_CR1_SPE
+        | (0<<SPI_CR1_BR_Pos)
+        | SPI_CR1_MSTR
+        | SPI_CR1_CPOL
+        | SPI_CR1_CPHA;
+    /* FIXME maybe try w/o BIDI */
 
     read_fb->brightness = 1;
     for (int i=0; i<sizeof(read_fb->data)/sizeof(uint32_t); i++) {
@@ -205,24 +328,12 @@ int main(void) {
     while (42) {
         led_state = (sys_time>>8)&7;
 
-        int ctr = sys_time>>2;
-        for (int bit=0, bmask=1; bit<nbits; bit++, bmask<<=1) {
-
-            int data = 0;
-            for (uint32_t ibit = 1, j=0; ibit; ibit<<=1, j++) {
-                int _100 = (1<<nbits);
-                int _1ff = (2*_100-1);
-                int val = (ctr + (j<<(nbits-5))) & _1ff;
-                val = val&_100 ? _1ff-val : val;
-                data |= val&bmask ? ibit : 0;
-            }
-
-            for (int seg=0; seg<frame_size_words; seg++)
-                write_fb->data[bit*frame_size_words + seg] = data;
+        if (fb_op == FB_FORMAT) {
+            transpose_data(rx_buf, read_fb);
+            fb_op = FB_UPDATE;
+            while (fb_op == FB_UPDATE)
+                ;
         }
-        fb_op = FB_UPDATE;
-        while (fb_op == FB_UPDATE)
-            ;
     }
 }
 
