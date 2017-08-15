@@ -83,17 +83,11 @@ void transpose_data(volatile uint8_t *rx_buf, volatile struct framebuf *out_fb) 
         };
     };
     struct data_format *rxp = (struct data_format *)rx_buf;
-    for (unsigned int digit=0; digit<nrows*ncols; digit++, rxp++) {
-        for (int segment=0; segment<8; segment++) {
-            uint32_t *outp = out_fb->data;
-            for (int bit=0x80; bit; bit>>=1, outp+=frame_size_words)
-                outp[segment] |= !!(rxp->high[segment] & bit) << digit;
-        }
-        uint16_t low = rxp->low;
-        for (int segment=0; segment<8; segment++) {
-            uint32_t *outp = out_fb->data;
-            for (int bit=0x8000; bit; bit>>=1, outp+=frame_size_words)
-                outp[segment] |= !!(rxp->high[segment] & bit) << digit;
+    for (int bit=0; bit<8; bit++) {
+        for (int seg=0; seg<8; seg++) {
+            for (int digit=0; digit<32; digit++) {
+                out_fb[(bit+2)*frame_size_words + seg] |= !!(rxp[digit].high[seg] & (1<<bit)) << digit;
+            }
         }
     }
 }
