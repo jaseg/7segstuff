@@ -23,8 +23,8 @@ void transpose_data(volatile uint8_t *rx_buf, volatile struct framebuf *out_fb) 
     }
     for (int bit=0; bit<2; bit++) { /* bits */
         volatile uint32_t *frame_data = out_fb->frame[bit].data;
-        uint16_t *inp = &rxp->low;
         for (int seg=0; seg<8; seg++) { /* segments */
+            uint16_t *inp = &rxp->low;
             uint32_t mask = 1 << bit << (seg*2);
             uint32_t acc = 0;
             for (int digit=0; digit<32; digit++) {
@@ -34,6 +34,7 @@ void transpose_data(volatile uint8_t *rx_buf, volatile struct framebuf *out_fb) 
             frame_data[seg] = acc;
         }
     }
+    out_fb->brightness = ((volatile struct framebuf *)rx_buf)->brightness;
 }
 
 

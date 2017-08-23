@@ -109,6 +109,9 @@ int shift_data() {
     spi_send(current_word>>16);
     strobe_leds();
 
+    if (current_word&0xffff)
+        asm("bkpt");
+
     return 1<<active_bit;
 }
 
@@ -153,6 +156,11 @@ void USART1_IRQHandler() {
     int addr = gaddr; /* FIXME DEBUG */
     int cmd = addr>>5;
     addr &= 0x1F;
+    /* Overrun detected? */
+    if (USART1->ISR & USART_ISR_ORE) {
+        USART1->ICR |= USART_ICR_ORECF;
+        USART1->RQR |= USART_RQR_MMRQ;
+    }
     /* Are we addressed? */
     if (addr != this_addr) {
         /* We are not. Mute USART until next idle condition */
@@ -181,14 +189,16 @@ return;
 }
 
 void DMA1_Channel2_3_IRQHandler() {
-    /* DMA Transfer complete, re-enable receive interrupt */
-    USART1->CR1 |= USART_CR1_RXNEIE;
+    /* DMA Transfer complete */
     /* ...and disable this DMA channel */
     USART1->CR3 &= ~USART_CR3_DMAR_Msk;
     DMA1_Channel3->CCR &= ~DMA_CCR_EN_Msk;
     /* Kick off formatting code in main loop outside interrupt context */
     fb_op = FB_FORMAT;
     DMA1->IFCR |= DMA_IFCR_CGIF3;
+    /* re-enable receive interrupt */
+    USART1->RQR |= USART_RQR_RXFRQ;
+    USART1->CR1 |= USART_CR1_RXNEIE;
 }
 
 void uart_config(void) {
@@ -224,7 +234,7 @@ void uart_config(void) {
         | DMA_CCR_CIRC;
 
     NVIC_EnableIRQ(USART1_IRQn);
-    NVIC_SetPriority(USART1_IRQn, 3);
+    NVIC_SetPriority(USART1_IRQn, 4);
     NVIC_EnableIRQ(DMA1_Channel2_3_IRQn);
     NVIC_SetPriority(DMA1_Channel2_3_IRQn, 3);
 }
@@ -303,7 +313,7 @@ int main(void) {
     /* Clear frame buffer */
     read_fb->brightness = 1;
     for (int i=0; i<sizeof(read_fb->data)/sizeof(uint32_t); i++) {
-        read_fb->data[i] = 0xffffffff; /*FIXME debug replace with 0x00000000 */
+        read_fb->data[i] = 0x00000000;
     }
 
     cfg_timer3();
@@ -319,7 +329,7 @@ int main(void) {
         }
         last_sys_time = sys_time;
         if (fb_op == FB_FORMAT) {
-            //transpose_data(rx_buf, read_fb);
+            transpose_data(rx_buf, write_fb);
             fb_op = FB_UPDATE;
             while (fb_op == FB_UPDATE)
                 ;
