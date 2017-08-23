@@ -49,7 +49,7 @@ volatile struct framebuf fb[2] = {0};
 volatile struct framebuf *read_fb=fb+0, *write_fb=fb+1;
 volatile int led_state = 0;
 volatile enum { FB_WRITE, FB_FORMAT, FB_UPDATE } fb_op;
-volatile uint8_t rx_buf[sizeof(struct framebuf)];
+volatile uint8_t rx_buf[sizeof(struct framebuf) + 4 /* crc */];
 volatile uint8_t this_addr = 0x05; /* FIXME */
 
 #define LED_COMM     0x0001
@@ -278,11 +278,21 @@ void uart_config(void) {
     DMA1_Channel3->CNDTR = sizeof(rx_buf);
     DMA1_Channel3->CCR = (0<<DMA_CCR_PL_Pos);
     DMA1_Channel3->CCR |=
-          (0<<DMA_CCR_MSIZE_Pos)
-        | (0<<DMA_CCR_PSIZE_Pos)
+          (0<<DMA_CCR_MSIZE_Pos) /* 8 bit */
+        | (0<<DMA_CCR_PSIZE_Pos) /* 8 bit */
         | DMA_CCR_MINC
         | DMA_CCR_TCIE
         | DMA_CCR_CIRC;
+
+    DMA1_Channel4->CPAR = (unsigned int)&CRC->DR;
+    DMA1_Channel4->CMAR = (unsigned int)rx_buf;
+    DMA1_Channel4->CCR = (0<<DMA_CCR_PL_Pos);
+    DMA1_Channel4->CCR |=
+          DMA_CCR_MEM2MEM /* Software trigger (precludes CIRC) */
+        | DMA_CCR_DIR /* Read from memory */
+        | (0<<DMA_CCR_MSIZE_Pos) /* 8 bit */
+        | (0<<DMA_CCR_PSIZE_Pos) /* 8 bit */
+        | DMA_CCR_MINC;
 
     NVIC_EnableIRQ(USART1_IRQn);
     NVIC_SetPriority(USART1_IRQn, 4);
@@ -290,6 +300,7 @@ void uart_config(void) {
     NVIC_SetPriority(DMA1_Channel2_3_IRQn, 3);
 }
 
+int errcnt = 0;
 int main(void) {
     RCC->CR |= RCC_CR_HSEON;
     while (!(RCC->CR&RCC_CR_HSERDY));
@@ -304,7 +315,7 @@ int main(void) {
 
     LL_Init1msTick(SystemCoreClock);
 
-    RCC->AHBENR  |= RCC_AHBENR_GPIOAEN | RCC_AHBENR_DMAEN;
+    RCC->AHBENR  |= RCC_AHBENR_GPIOAEN | RCC_AHBENR_DMAEN | RCC_AHBENR_CRCEN;
     RCC->APB2ENR |= RCC_APB2ENR_SPI1EN | RCC_APB2ENR_USART1EN;
     RCC->APB1ENR |= RCC_APB1ENR_TIM3EN;
 
@@ -358,12 +369,24 @@ int main(void) {
     int last_sys_time=0;
     while (42) {
         led_state = (sys_time>>8)&7;
-        if ((sys_time ^ last_sys_time) & (1<<4)) {
-            USART1->TDR = i++;
-        }
         last_sys_time = sys_time;
         if (fb_op == FB_FORMAT) {
+            CRC->CR |= CRC_CR_RESET;
+            DMA1_Channel4->CNDTR = sizeof(struct framebuf);
+            DMA1_Channel4->CCR |= DMA_CCR_EN;
+
             transpose_data(rx_buf, write_fb);
+
+            while (!(DMA1->ISR & DMA_ISR_TCIF4))
+                ;
+            DMA1->IFCR |= DMA_IFCR_CGIF4;
+            DMA1_Channel4->CCR &= ~DMA_CCR_EN_Msk;
+
+            if (CRC->DR != *(uint32_t *)(rx_buf+sizeof(struct framebuf))) {
+                fb_op = FB_WRITE;
+                errcnt++;
+            }
+
             fb_op = FB_UPDATE;
             while (fb_op == FB_UPDATE)
                 ;

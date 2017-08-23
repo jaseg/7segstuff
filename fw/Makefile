@@ -32,7 +32,7 @@ LDFLAGS += -L$(CMSIS_PATH)/Lib/GCC -larm_cortexM0l_math
 
 .PHONY: program clean
 
-all: main.elf main.pdf
+all: main.elf
 
 cmsis_exports.c: $(CMSIS_DEV_PATH)/Include/stm32f030x6.h $(CMSIS_PATH)/Include/core_cm0.h
 	python3 gen_cmsis_exports.py $^ > $@
@@ -48,7 +48,7 @@ cmsis_exports.c: $(CMSIS_DEV_PATH)/Include/stm32f030x6.h $(CMSIS_PATH)/Include/c
 %.dot: %.elf
 	r2 -a arm -qc 'aa;agC' $< 2>/dev/null >$@
 
-main.elf: main.o startup_stm32f030x6.o system_stm32f0xx.o $(HAL_PATH)/Src/stm32f0xx_ll_utils.o base.o semihosting.o cmsis_exports.o transpose.o
+main.elf: main.o startup_stm32f030x6.o system_stm32f0xx.o $(HAL_PATH)/Src/stm32f0xx_ll_utils.o base.o cmsis_exports.o transpose.o
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LIBS)
 	$(OBJCOPY) -O ihex $@ $(@:.elf=.hex)
 	$(OBJCOPY) -O binary $@ $(@:.elf=.bin)
@@ -65,8 +65,13 @@ transpose.elf: transpose.c transpose_main.c
 transpose_test: transpose.elf
 	./transpose.elf
 
+_crc.so: crc.c
+	gcc -o $@ -shared -fPIC -g $^
+
 clean:
 	rm -f **.o
 	rm -f main.elf main.hex main.bin main.map main.lst
 	rm -f **.expand
+	rm -f transpose.elf
+	rm -f crc.so
 
