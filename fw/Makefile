@@ -34,6 +34,9 @@ LDFLAGS += -L$(CMSIS_PATH)/Lib/GCC -larm_cortexM0l_math
 
 all: main.elf main.pdf
 
+cmsis_exports.c: $(CMSIS_DEV_PATH)/Include/stm32f030x6.h $(CMSIS_PATH)/Include/core_cm0.h
+	python3 gen_cmsis_exports.py $^ > $@
+
 %.o: %.c
 	$(CC) -c $(CFLAGS) -o $@ $^
 	$(CC) -E $(CFLAGS) -o $(@:.o=.pp) $^
@@ -45,7 +48,7 @@ all: main.elf main.pdf
 %.dot: %.elf
 	r2 -a arm -qc 'aa;agC' $< 2>/dev/null >$@
 
-main.elf: main.o startup_stm32f030x6.o system_stm32f0xx.o $(HAL_PATH)/Src/stm32f0xx_ll_utils.o base.o semihosting.o
+main.elf: main.o startup_stm32f030x6.o system_stm32f0xx.o $(HAL_PATH)/Src/stm32f0xx_ll_utils.o base.o semihosting.o cmsis_exports.o transpose.o
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LIBS)
 	$(OBJCOPY) -O ihex $@ $(@:.elf=.hex)
 	$(OBJCOPY) -O binary $@ $(@:.elf=.bin)
@@ -54,6 +57,13 @@ main.elf: main.o startup_stm32f030x6.o system_stm32f0xx.o $(HAL_PATH)/Src/stm32f
 	
 program: main.elf openocd.cfg
 	openocd -f openocd.cfg -c "program $< verify reset exit"
+
+transpose.elf: transpose.c transpose_main.c
+	gcc -g -Wall -Wpedantic -o $@ $^
+
+.PHONY: transpose_test
+transpose_test: transpose.elf
+	./transpose.elf
 
 clean:
 	rm -f **.o
