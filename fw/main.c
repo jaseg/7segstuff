@@ -58,20 +58,63 @@ volatile uint8_t this_addr = 0x05; /* FIXME */
 #define SR_ILED_HIGH 0x0080
 #define SR_ILED_LOW  0x0040
 
-void shift_aux(int global_current, int leds, int active_segment) {
-    spi_send(
-              (global_current ? SR_ILED_HIGH : SR_ILED_LOW)
-            | (leds<<1)
-            | (0xff00 ^ (0x100<<active_segment)));
-    strobe_aux();
-}
-
 inline unsigned int stk_start() {
     return SysTick->VAL;
 }
 
 inline unsigned int stk_end(unsigned int start) {
     return (start - SysTick->VAL) & 0xffffff;
+}
+
+enum {
+    SPI_AUX,
+    SPI_WORD0,
+    SPI_WORD1,
+    SPI_IDLE,
+} spi_state;
+static volatile uint32_t spi_word = 0;
+
+void cfg_spi1() {
+    /* Configure SPI controller */
+    SPI1->I2SCFGR = 0;
+    SPI1->CR2 &= ~SPI_CR2_DS_Msk;
+    SPI1->CR2 &= ~SPI_CR2_DS_Msk;
+    SPI1->CR2 |= LL_SPI_DATAWIDTH_16BIT;
+
+    /* Baud rate PCLK/2 -> 25MHz */
+    SPI1->CR1 =
+          SPI_CR1_BIDIMODE
+        | SPI_CR1_BIDIOE
+        | SPI_CR1_SSM
+        | SPI_CR1_SSI
+        | SPI_CR1_SPE
+        | (0<<SPI_CR1_BR_Pos)
+        | SPI_CR1_MSTR
+        | SPI_CR1_CPOL
+        | SPI_CR1_CPHA;
+    /* FIXME maybe try w/o BIDI */
+
+    NVIC_EnableIRQ(SPI1_IRQn);
+    NVIC_SetPriority(SPI1_IRQn, 2);
+}
+
+void SPI1_IRQHandler() {
+    switch (spi_state) {
+        case SPI_AUX:
+            strobe_aux();
+            SPI1->DR = spi_word>>16;
+            break;
+        case SPI_WORD0:
+            SPI1->DR = spi_word&0xFFFF;
+            break;
+        default:
+            tick(); /* This one is important. Otherwise, weird stuff happens and parts of the aux register seem to leak
+                       into the driver registers. */
+            strobe_leds();
+            SPI1->CR2 &= ~SPI_CR2_TXEIE;
+            break;
+    }
+    spi_state ++;
 }
 
 static volatile int frame_duration;
@@ -82,6 +125,7 @@ int shift_data() {
     static int last_frame_sys_time;
 
     /* Note: On boot, multiplexing will start with bit 1 due to the next few lines. This is perfectly ok. */
+    int rv = 1<<active_bit;
     active_bit++;
     if (active_bit == nbits) {
         active_bit = 0;
@@ -101,25 +145,30 @@ int shift_data() {
             }
         }
 
-        shift_aux(read_fb->brightness, led_state, active_segment);
+        spi_word = read_fb->data[active_bit*frame_size_words + active_segment];
+        spi_state = SPI_AUX;
+        SPI1->DR = (read_fb->brightness ? SR_ILED_HIGH : SR_ILED_LOW)
+            | (led_state<<1)
+            | (0xff00 ^ (0x100<<active_segment));
+    } else {
+        spi_word = read_fb->data[active_bit*frame_size_words + active_segment];
+        spi_state = SPI_WORD0;
+        SPI1->DR = spi_word>>16;
     }
+    SPI1->CR2 |= SPI_CR2_TXEIE;
 
-    uint32_t current_word = read_fb->data[active_bit*frame_size_words + active_segment];
-    spi_send(current_word&0xffff);
-    spi_send(current_word>>16);
-    strobe_leds();
-
-    if (current_word&0xffff)
-        asm("bkpt");
-
-    return 1<<active_bit;
+    return rv;
 }
 
 void cfg_timer3() {
+    /* Capture/compare channel 1 is used to generate the LED driver !OE signal. Channel 2 is used to trigger the
+     * interrupt to load the next bits in to the shift registers. Channel 2 triggers simultaneously with channel 1 at
+     * long !OE periods but will be delayed slightly to a fixed 32 timer periods (12.8us) to allow for SPI1 to finish
+     * shifting out all frame data before asserting !OE. */
     TIM3->CCMR1 = 6<<TIM_CCMR1_OC1M_Pos; /* PWM Mode 1 */
-    TIM3->CCER  = TIM_CCER_CC1E | TIM_CCER_CC1P; /* Inverting output */
-    TIM3->DIER  = TIM_DIER_CC1IE;
-    TIM3->CCR1  = 1000; /* Schedule first interrupt */
+    TIM3->CCER  = TIM_CCER_CC1E | TIM_CCER_CC1P | TIM_CCER_CC2E | TIM_CCER_CC2P; /* Inverting output */
+    TIM3->DIER  = TIM_DIER_CC2IE;
+    TIM3->CCR2  = 1000; /* Schedule first interrupt */
     TIM3->PSC   = SystemCoreClock/5000000 * 2; /* 0.40us/tick */
     TIM3->ARR   = 0xffff;
     TIM3->EGR  |= TIM_EGR_UG;
@@ -129,16 +178,18 @@ void cfg_timer3() {
     NVIC_SetPriority(TIM3_IRQn, 2);
 }
 
-
 void TIM3_IRQHandler() {
     //TIM3->CR1 &= ~TIM_CR1_CEN_Msk; FIXME
 
-    /* This takes about 10us */
     int period = shift_data();
     TIM3->CCR1 = period;
-    TIM3->CNT = 0xffff; /* To not enable OC1 right away */
+    if (period < 32) /* FIXME this constant */
+        TIM3->CCR2 = 32;
+    else
+        TIM3->CCR2 = period;
+    TIM3->CNT = 0xffff; /* To not enable OC1 riglt away */
 
-    TIM3->SR &= ~TIM_SR_CC1IF_Msk;
+    TIM3->SR &= ~TIM_SR_CC2IF_Msk;
     //TIM3->CR1 |= TIM_CR1_CEN;
 }
 
@@ -291,29 +342,12 @@ int main(void) {
         | (1<<GPIO_PUPDR_PUPDR2_Pos)  /* TX */
         | (1<<GPIO_PUPDR_PUPDR3_Pos); /* RX */
 
-    /* Configure SPI controller */
-    SPI1->I2SCFGR = 0;
-    SPI1->CR2 &= ~SPI_CR2_DS_Msk;
-    SPI1->CR2 &= ~SPI_CR2_DS_Msk;
-    SPI1->CR2 |= LL_SPI_DATAWIDTH_16BIT;
-
-    /* Baud rate PCLK/2 -> 25MHz */
-    SPI1->CR1 =
-          SPI_CR1_BIDIMODE
-        | SPI_CR1_BIDIOE
-        | SPI_CR1_SSM
-        | SPI_CR1_SSI
-        | SPI_CR1_SPE
-        | (0<<SPI_CR1_BR_Pos)
-        | SPI_CR1_MSTR
-        | SPI_CR1_CPOL
-        | SPI_CR1_CPHA;
-    /* FIXME maybe try w/o BIDI */
+    cfg_spi1();
 
     /* Clear frame buffer */
     read_fb->brightness = 1;
     for (int i=0; i<sizeof(read_fb->data)/sizeof(uint32_t); i++) {
-        read_fb->data[i] = 0x00000000;
+        read_fb->data[i] = 0xffffffff; /* FIXME DEBUG 0x00000000; */
     }
 
     cfg_timer3();
