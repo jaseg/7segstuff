@@ -7,4 +7,6 @@
 *.bin
 *.hex
 *.pp
+
 transpose.elf
+cmsis_exports.c
