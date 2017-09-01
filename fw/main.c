@@ -43,14 +43,47 @@ void strobe_leds(void) {
     GPIOA->BSRR = GPIO_BSRR_BR_9;
 }
 
-static volatile unsigned int sys_time = 0;
+volatile unsigned int sys_time = 0;
 
 volatile struct framebuf fb[2] = {0};
 volatile struct framebuf *read_fb=fb+0, *write_fb=fb+1;
 volatile int led_state = 0;
 volatile enum { FB_WRITE, FB_FORMAT, FB_UPDATE } fb_op;
 volatile uint8_t rx_buf[sizeof(struct framebuf) + 4 /* crc */];
+volatile union {
+    struct {
+        uint32_t millifps;
+    } fps_reply;
+} tx_buf;
 volatile uint8_t this_addr = 0x05; /* FIXME */
+
+union {
+    struct {
+        uint8_t device_id __attribute__((aligned(2)));
+    };
+    uint16_t flash_data[0];
+} flash_data __attribute__((section ("configflash")));
+
+void write_config(void *target, uint16_t value) {
+    FLASH->KEYR = 0x45670123;
+    FLASH->KEYR = 0xCDEF89AB;
+    FLASH->CR = FLASH_CR_PG;
+    *(uint16_t *)target = value;
+    while (FLASH->SR & FLASH_SR_BSY)
+        ;
+    FLASH->CR = FLASH_CR_LOCK;
+}
+
+void erase_config() {
+    FLASH->KEYR = 0x45670123;
+    FLASH->KEYR = 0xCDEF89AB;
+    FLASH->CR = FLASH_CR_PER;
+    FLASH->AR = (uint32_t)&flash_data;
+    FLASH->CR = FLASH_CR_STRT;
+    while (FLASH->SR & FLASH_SR_BSY)
+        ;
+    FLASH->CR = FLASH_CR_LOCK;
+}
 
 #define LED_COMM     0x0001
 #define LED_ERROR    0x0002
@@ -64,6 +97,10 @@ inline unsigned int stk_start() {
 
 inline unsigned int stk_end(unsigned int start) {
     return (start - SysTick->VAL) & 0xffffff;
+}
+
+inline unsigned int stk_microseconds() {
+    return sys_time*1000 + (1000 - (SysTick->VAL / (SystemCoreClock/1000000)));
 }
 
 enum {
@@ -117,15 +154,16 @@ void SPI1_IRQHandler() {
     spi_state ++;
 }
 
-static volatile int frame_duration;
+uint8_t segment_map[8] = {5, 7, 6, 4, 1, 3, 0, 2};
+
+static volatile int frame_duration_us;
 /* returns new bit time in cycles */
 int shift_data() {
     static int active_segment = 0;
     static unsigned int active_bit = 0;
-    static int last_frame_sys_time;
+    static unsigned int last_frame_time;
 
     /* Note: On boot, multiplexing will start with bit 1 due to the next few lines. This is perfectly ok. */
-    int rv = 1<<active_bit;
     active_bit++;
     if (active_bit == nbits) {
         active_bit = 0;
@@ -134,9 +172,9 @@ int shift_data() {
         if (active_segment == nsegments) {
             active_segment = 0;
 
-            int time = sys_time;
-            frame_duration = time - last_frame_sys_time;
-            last_frame_sys_time = sys_time;
+            int time = stk_microseconds();
+            frame_duration_us = time - last_frame_time;
+            last_frame_time = time;
             if (fb_op == FB_UPDATE) {
                 volatile struct framebuf *tmp = read_fb;
                 read_fb = write_fb;
@@ -149,7 +187,7 @@ int shift_data() {
         spi_state = SPI_AUX;
         SPI1->DR = (read_fb->brightness ? SR_ILED_HIGH : SR_ILED_LOW)
             | (led_state<<1)
-            | (0xff00 ^ (0x100<<active_segment));
+            | (0xff00 ^ (0x100<<segment_map[active_segment]));
     } else {
         spi_word = read_fb->data[active_bit*frame_size_words + active_segment];
         spi_state = SPI_WORD0;
@@ -157,7 +195,7 @@ int shift_data() {
     }
     SPI1->CR2 |= SPI_CR2_TXEIE;
 
-    return rv;
+    return 1<<active_bit;
 }
 
 void cfg_timer3() {
@@ -198,7 +236,15 @@ enum Command {
     CMD_SET_ADDR,
     CMD_SET_FB,
     CMD_GET_DESC,
+    CMD_GET_FRAMERATE,
+    CMD_ERASE_CONFIG,
 };
+
+enum {
+    PROT_ADDR,
+    PROT_CMD,
+    PROT_
+} protocol_state = PROT_ADDR;
 
 int gaddr;
 void USART1_IRQHandler() {
@@ -214,11 +260,16 @@ void USART1_IRQHandler() {
     }
     /* Are we addressed? */
     if (addr != this_addr) {
+        asm("bkpt");
         /* We are not. Mute USART until next idle condition */
         USART1->RQR |= USART_RQR_MMRQ;
     } else {
         /* We are. Switch by command. */
         switch (cmd) {
+        case CMD_PING:
+            USART1->TDR = 42;
+            USART1->RQR |= USART_RQR_MMRQ;
+            break;
         case CMD_SET_FB:
             /* Are we ready to process new frame data? */
             if (fb_op != FB_WRITE) {
@@ -231,6 +282,13 @@ void USART1_IRQHandler() {
             DMA1->IFCR |= DMA_IFCR_CGIF3;
             DMA1_Channel3->CCR |= DMA_CCR_EN;
             USART1->CR3 |= USART_CR3_DMAR;
+            break;
+        case CMD_GET_FRAMERATE:
+            tx_buf.fps_reply.millifps = frame_duration_us > 0 ? 1000000000 / frame_duration_us : 0;
+            DMA1_Channel4->CNDTR = sizeof(tx_buf.fps_reply);
+            USART1->ICR |= USART_ICR_TCCF; /* FIXME: (1) is this necessary? (2) where should this be done? */
+            DMA1_Channel4->CCR |= DMA_CCR_EN;
+            USART1->RQR |= USART_RQR_MMRQ;
             break;
         }
     }
@@ -252,6 +310,11 @@ void DMA1_Channel2_3_IRQHandler() {
     USART1->CR1 |= USART_CR1_RXNEIE;
 }
 
+void DMA1_Channel4_5_IRQHandler() {
+    DMA1->IFCR |= DMA_IFCR_CGIF4;
+    DMA1_Channel4->CCR &= ~DMA_CCR_EN_Msk;
+}
+
 void uart_config(void) {
     USART1->CR1 = /* 8-bit -> M1, M0 clear */
         /* RTOIE clear */
@@ -267,16 +330,17 @@ void uart_config(void) {
         | USART_CR1_TE
         | USART_CR1_RE;
     //USART1->CR2 = USART_CR2_RTOEN; /* Timeout enable */
-    USART1->CR3 = USART_CR3_DEM; /* RS485 DE enable (output on RTS) */
+    USART1->CR3 = USART_CR3_DEM /* RS485 DE enable (output on RTS) */
+            | USART_CR3_DMAT;
     int usartdiv = 25;
     USART1->BRR = usartdiv;
     USART1->CR1 |= USART_CR1_UE;
 
-    /* Configure DMA for USART frame data reception */
+    /* Configure DMA 1 / Channel 3 for USART frame data reception: USART1->RDR -> rx_buf */
     DMA1_Channel3->CPAR = (unsigned int)&USART1->RDR;
     DMA1_Channel3->CMAR = (unsigned int)rx_buf;
     DMA1_Channel3->CNDTR = sizeof(rx_buf);
-    DMA1_Channel3->CCR = (0<<DMA_CCR_PL_Pos);
+    DMA1_Channel3->CCR = (1<<DMA_CCR_PL_Pos);
     DMA1_Channel3->CCR |=
           (0<<DMA_CCR_MSIZE_Pos) /* 8 bit */
         | (0<<DMA_CCR_PSIZE_Pos) /* 8 bit */
@@ -284,20 +348,36 @@ void uart_config(void) {
         | DMA_CCR_TCIE
         | DMA_CCR_CIRC;
 
-    DMA1_Channel4->CPAR = (unsigned int)&CRC->DR;
-    DMA1_Channel4->CMAR = (unsigned int)rx_buf;
-    DMA1_Channel4->CCR = (0<<DMA_CCR_PL_Pos);
-    DMA1_Channel4->CCR |=
+    /* Configure DMA 1 / Channel 5 for USART frame data CRC check: rx_buf -> CRC->DR */
+    DMA1_Channel5->CPAR = (unsigned int)&CRC->DR;
+    DMA1_Channel5->CMAR = (unsigned int)rx_buf;
+    DMA1_Channel5->CCR = (0<<DMA_CCR_PL_Pos);
+    DMA1_Channel5->CCR |=
           DMA_CCR_MEM2MEM /* Software trigger (precludes CIRC) */
         | DMA_CCR_DIR /* Read from memory */
         | (0<<DMA_CCR_MSIZE_Pos) /* 8 bit */
         | (0<<DMA_CCR_PSIZE_Pos) /* 8 bit */
         | DMA_CCR_MINC;
 
+    /* Configure DMA 1 / Channel 4 for USART reply transmission */
+    DMA1_Channel4->CPAR = (unsigned int)&USART1->TDR;
+    DMA1_Channel4->CMAR = (unsigned int)&tx_buf;
+    DMA1_Channel4->CCR = (0<<DMA_CCR_PL_Pos);
+    DMA1_Channel4->CCR |=
+          DMA_CCR_DIR /* Read from memory */
+        | (0<<DMA_CCR_MSIZE_Pos) /* 8 bit */
+        | (0<<DMA_CCR_PSIZE_Pos) /* 8 bit */
+        | DMA_CCR_MINC
+        | DMA_CCR_TCIE;
+    
+    SYSCFG->CFGR1 |= SYSCFG_CFGR1_USART1TX_DMA_RMP;
+
     NVIC_EnableIRQ(USART1_IRQn);
     NVIC_SetPriority(USART1_IRQn, 4);
     NVIC_EnableIRQ(DMA1_Channel2_3_IRQn);
     NVIC_SetPriority(DMA1_Channel2_3_IRQn, 3);
+    NVIC_EnableIRQ(DMA1_Channel4_5_IRQn);
+    NVIC_SetPriority(DMA1_Channel4_5_IRQn, 5);
 }
 
 int errcnt = 0;
@@ -313,10 +393,8 @@ int main(void) {
     RCC->CFGR |= (2<<RCC_CFGR_SW_Pos);
     SystemCoreClockUpdate();
 
-    LL_Init1msTick(SystemCoreClock);
-
     RCC->AHBENR  |= RCC_AHBENR_GPIOAEN | RCC_AHBENR_DMAEN | RCC_AHBENR_CRCEN;
-    RCC->APB2ENR |= RCC_APB2ENR_SPI1EN | RCC_APB2ENR_USART1EN;
+    RCC->APB2ENR |= RCC_APB2ENR_SPI1EN | RCC_APB2ENR_USART1EN | RCC_APB2ENR_SYSCFGEN;
     RCC->APB1ENR |= RCC_APB1ENR_TIM3EN;
 
     GPIOA->MODER |=
@@ -365,31 +443,27 @@ int main(void) {
     SysTick_Config(SystemCoreClock/1000); /* 1ms interval */
     uart_config();
 
-    uint8_t i=0;
-    int last_sys_time=0;
     while (42) {
-        led_state = (sys_time>>8)&7;
-        last_sys_time = sys_time;
         if (fb_op == FB_FORMAT) {
             CRC->CR |= CRC_CR_RESET;
-            DMA1_Channel4->CNDTR = sizeof(struct framebuf);
-            DMA1_Channel4->CCR |= DMA_CCR_EN;
+            DMA1_Channel5->CNDTR = sizeof(struct framebuf);
+            DMA1_Channel5->CCR |= DMA_CCR_EN;
 
             transpose_data(rx_buf, write_fb);
 
             while (!(DMA1->ISR & DMA_ISR_TCIF4))
                 ;
             DMA1->IFCR |= DMA_IFCR_CGIF4;
-            DMA1_Channel4->CCR &= ~DMA_CCR_EN_Msk;
+            DMA1_Channel5->CCR &= ~DMA_CCR_EN_Msk;
 
             if (CRC->DR != *(uint32_t *)(rx_buf+sizeof(struct framebuf))) {
                 fb_op = FB_WRITE;
                 errcnt++;
+            } else {
+                fb_op = FB_UPDATE;
+                while (fb_op == FB_UPDATE)
+                    ;
             }
-
-            fb_op = FB_UPDATE;
-            while (fb_op == FB_UPDATE)
-                ;
         }
     }
 }

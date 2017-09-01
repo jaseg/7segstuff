@@ -4,6 +4,12 @@
 
 #include "transpose.h"
 
+uint8_t digit_map[33] = {
+     0, 1, 2, 3,       28,29,30,31,
+      4, 5, 6, 7,     24,25,26,27,
+       8, 9,10,11,   20,21,22,23,
+       12,13,14,15, 16,17,18,19
+};
 void transpose_data(volatile uint8_t *rx_buf, volatile struct framebuf *out_fb) {
     memset((uint8_t *)out_fb, 0, sizeof(*out_fb));
     struct data_format *rxp = (struct data_format *)rx_buf;
@@ -15,7 +21,7 @@ void transpose_data(volatile uint8_t *rx_buf, volatile struct framebuf *out_fb) 
             uint32_t acc = 0;
             uint8_t *inp = start_inp++;
             for (int digit=0; digit<32; digit++) {
-                acc |= (*inp & bit_mask) >> bit << digit;
+                acc |= (*inp & bit_mask) >> bit << digit_map[digit];
                 inp += sizeof(struct data_format);
             }
             *outp = acc;
@@ -28,7 +34,7 @@ void transpose_data(volatile uint8_t *rx_buf, volatile struct framebuf *out_fb) 
             uint32_t mask = 1 << bit << (seg*2);
             uint32_t acc = 0;
             for (int digit=0; digit<32; digit++) {
-                acc |= (*inp & mask) >> bit >> seg << digit;
+                acc |= (*inp & mask) >> bit >> (seg*2) << digit_map[digit];
                 inp += sizeof(struct data_format)/sizeof(uint16_t);
             }
             frame_data[seg] = acc;
