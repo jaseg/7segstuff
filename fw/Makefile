@@ -3,19 +3,21 @@ CMSIS_PATH 		?= STM32Cube/Drivers/CMSIS
 CMSIS_DEV_PATH  ?= $(CMSIS_PATH)/Device/ST/STM32F0xx
 HAL_PATH   		?= STM32Cube/Drivers/STM32F0xx_HAL_Driver
 
+BUS_ADDR        ?= 0
+
 CC      := arm-none-eabi-gcc
 LD      := arm-none-eabi-ld
 OBJCOPY := arm-none-eabi-objcopy
 OBJDUMP := arm-none-eabi-objdump
 SIZE    := arm-none-eabi-size
 
-CFLAGS  = -g -Wall -std=gnu11 -O2 -fdump-rtl-expand
+CFLAGS  = -g -Wall -std=gnu11 -O2 -fdump-rtl-expand -DBUS_ADDR=$(BUS_ADDR)
 CFLAGS += -mlittle-endian -mcpu=cortex-m0 -march=armv6-m -mthumb
 #CFLAGS += -ffunction-sections -fdata-sections
 LDFLAGS = -nostartfiles
 #LDFLAGS += -specs=rdimon.specs -DSEMIHOSTING
 LDFLAGS += -Wl,-Map=main.map -nostdlib
-#LDFLAGS += -Wl,--gc-sections 
+LDFLAGS += -Wl,--gc-sections 
 LIBS = -lgcc
 #LIBS += -lrdimon
 
@@ -30,7 +32,7 @@ LDFLAGS += -L$(CMSIS_PATH)/Lib/GCC -larm_cortexM0l_math
 
 ###################################################
 
-.PHONY: program clean
+.PHONY: program clean bus_addr.c
 
 all: main.elf
 
@@ -39,20 +41,24 @@ cmsis_exports.c: $(CMSIS_DEV_PATH)/Include/stm32f030x6.h $(CMSIS_PATH)/Include/c
 
 %.o: %.c
 	$(CC) -c $(CFLAGS) -o $@ $^
-	$(CC) -E $(CFLAGS) -o $(@:.o=.pp) $^
+#	$(CC) -E $(CFLAGS) -o $(@:.o=.pp) $^
 
 %.o: %.s
 	$(CC) -c $(CFLAGS) -o $@ $^
-	$(CC) -E $(CFLAGS) -o $(@:.o=.pp) $^
+#	$(CC) -E $(CFLAGS) -o $(@:.o=.pp) $^
 
 %.dot: %.elf
 	r2 -a arm -qc 'aa;agC' $< 2>/dev/null >$@
 	
-sources.tar.xz: main.c transpose.c transpose.h
+sources.tar.xz: main.c transpose.c transpose.h Makefile
 	tar -caf $@ $^
 
-sources.c: sources.tar.xz
-	xxd -i $< | sed 's/=/__attribute__((section(".text")))=/' > $@
+# don't ask...
+sources.tar.xz.zip: sources.tar.xz
+	zip $@ $^
+
+sources.c: sources.tar.xz.zip
+	xxd -i $< | head -n -1 | sed 's/=/__attribute__((section(".source_tarball"))) =/' > $@
 
 main.elf: main.o startup_stm32f030x6.o system_stm32f0xx.o $(HAL_PATH)/Src/stm32f0xx_ll_utils.o base.o cmsis_exports.o transpose.o bus_addr.o sources.o
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LIBS)
