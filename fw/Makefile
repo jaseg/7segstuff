@@ -52,9 +52,9 @@ sources.tar.xz: main.c transpose.c transpose.h
 	tar -caf $@ $^
 
 sources.c: sources.tar.xz
-	xxd -i $< > $@
+	xxd -i $< | sed 's/=/__attribute__((section(".text")))=/' > $@
 
-main.elf: main.o startup_stm32f030x6.o system_stm32f0xx.o $(HAL_PATH)/Src/stm32f0xx_ll_utils.o base.o cmsis_exports.o transpose.o bus_addr.o
+main.elf: main.o startup_stm32f030x6.o system_stm32f0xx.o $(HAL_PATH)/Src/stm32f0xx_ll_utils.o base.o cmsis_exports.o transpose.o bus_addr.o sources.o
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LIBS)
 	$(OBJCOPY) -O ihex $@ $(@:.elf=.hex)
 	$(OBJCOPY) -O binary $@ $(@:.elf=.bin)
@@ -80,4 +80,6 @@ clean:
 	rm -f **.expand
 	rm -f transpose.elf
 	rm -f crc.so
+	rm -f sources.tar.xz
+	rm -f sources.c
 

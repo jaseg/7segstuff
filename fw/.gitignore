@@ -1,4 +1,5 @@
 *.o
+*.so
 *.dot
 *.lst
 *.map
@@ -10,3 +11,8 @@
 
 transpose.elf
 cmsis_exports.c
+sources.c
+sources.tar.xz
+bus_addr.c
+__pycache__
+.ipynb_checkpoints
