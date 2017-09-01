@@ -2,8 +2,8 @@
 ENTRY(Reset_Handler)
 
 MEMORY {
-  FLASH (rx): ORIGIN = 0x08000000, LENGTH = 14K
-  CONFIGFLASH (rw): ORIGIN = 0x08003800, LENGTH = 2K
+  FLASH (rx): ORIGIN = 0x08000000, LENGTH = 0x3C00
+  CONFIGFLASH (rw): ORIGIN = 0x08003C00, LENGTH = 0x400
   RAM (xrw):  ORIGIN = 0x20000000, LENGTH = 4K
 }
 
@@ -39,11 +39,13 @@ SECTIONS {
         _sidata = _etext;
     } >FLASH
 
+    /*
     .configflash : {
-        . = ALIGN(2048);
+        . = ALIGN(0x400);
         *(.configdata)
         _econfig = .;
-    } >CONFIGFLASH
+    } >FLASH
+    */
     
     /* This is the initialized data section
     The program executes knowing that the data is in the RAM

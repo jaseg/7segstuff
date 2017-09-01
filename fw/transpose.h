@@ -3,25 +3,25 @@
 
 #include <stdint.h>
 
-enum Segment { SegA, SegB, SegC, SegD, SegE, SegF, SegG, SegDP, nsegments };
+enum Segment { SegA, SegB, SegC, SegD, SegE, SegF, SegG, SegDP, NSEGMENTS };
 enum {
-    nrows = 4,
-    ncols = 8,
-    nbits = 10,
+    NROWS = 4,
+    NCOLS = 8,
+    MAX_BITS = 10,
 };
 
 enum {
-    frame_size_words = nrows*ncols*nsegments/32,
+    FRAME_SIZE_WORDS = NROWS*NCOLS*NSEGMENTS/32,
 };
 
 struct framebuf {
     /* Multiplexing order: first Digits, then Time/bits, last Segments */
     union {
-        uint32_t data[nbits*frame_size_words];
+        uint32_t data[MAX_BITS*FRAME_SIZE_WORDS];
         struct {
             struct {
-                uint32_t data[frame_size_words];
-            } frame[nbits];
+                uint32_t data[FRAME_SIZE_WORDS];
+            } frame[MAX_BITS];
         };
     };
     uint8_t brightness; /* 0 or 1; controls global brighntess control */
