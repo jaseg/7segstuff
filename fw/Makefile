@@ -11,13 +11,13 @@ OBJCOPY := arm-none-eabi-objcopy
 OBJDUMP := arm-none-eabi-objdump
 SIZE    := arm-none-eabi-size
 
-CFLAGS  = -g -Wall -std=gnu11 -O2 -fdump-rtl-expand -DBUS_ADDR=$(BUS_ADDR)
+CFLAGS  = -g -Wall -std=gnu11 -O0 -fdump-rtl-expand -DBUS_ADDR=$(BUS_ADDR)
 CFLAGS += -mlittle-endian -mcpu=cortex-m0 -march=armv6-m -mthumb
 #CFLAGS += -ffunction-sections -fdata-sections
 LDFLAGS = -nostartfiles
 #LDFLAGS += -specs=rdimon.specs -DSEMIHOSTING
 LDFLAGS += -Wl,-Map=main.map -nostdlib
-LDFLAGS += -Wl,--gc-sections 
+#LDFLAGS += -Wl,--gc-sections 
 LIBS = -lgcc
 #LIBS += -lrdimon
 

@@ -46,8 +46,13 @@ void strobe_leds(void) {
 #define FIRMWARE_VERSION 1
 #define HARDWARE_VERSION 1
 
-volatile uint16_t adc_vcc_mv = 0;
-volatile uint16_t adc_temp_tenth_celsius = 0;
+#define TS_CAL1 (*(uint16_t *)0x1FFFF7B8)
+#define VREFINT_CAL (*(uint16_t *)0x1FFFF7BA)
+
+volatile  int16_t adc_vcc_mv = 0;
+volatile  int16_t adc_temp_tenth_celsius = 0;
+
+volatile uint16_t adc_buf[2];
 
 volatile unsigned int sys_time = 0;
 volatile unsigned int sys_time_seconds = 0;
@@ -71,7 +76,7 @@ volatile union {
                  digit_cols;
         uint32_t uptime;
         uint32_t millifps;
-        uint16_t vcc_mv,
+         int16_t vcc_mv,
                  temp_tenth_celsius;
         uint8_t  nbits;
     } desc_reply;
@@ -85,15 +90,15 @@ extern uint8_t bus_addr;
 #define SR_ILED_HIGH 0x0080
 #define SR_ILED_LOW  0x0040
 
-inline unsigned int stk_start() {
+unsigned int stk_start(void) {
     return SysTick->VAL;
 }
 
-inline unsigned int stk_end(unsigned int start) {
+unsigned int stk_end(unsigned int start) {
     return (start - SysTick->VAL) & 0xffffff;
 }
 
-inline unsigned int stk_microseconds() {
+unsigned int stk_microseconds(void) {
     return sys_time*1000 + (1000 - (SysTick->VAL / (SystemCoreClock/1000000)));
 }
 
@@ -235,13 +240,17 @@ enum Command {
 };
 
 enum {
-    PROT_ADDR,
+    PROT_ADDR_IDLE,
+    PROT_ADDR_ERR,
+    PROT_ADDR_COMPLETE,
+    PROT_ADDR_CRC,
+    PROT_ADDR_INIT,
     PROT_CMD,
     PROT_CRC,
     PROT_COMPLETE,
     PROT_INVALID,
     N_PROT_STATES
-} protocol_state = PROT_ADDR;
+} protocol_state = PROT_ADDR_INIT;
 
 void crc_reset(void) {
     CRC->CR |= CRC_CR_RESET;
@@ -282,35 +291,44 @@ int crc_error_count = 0;
 static volatile uint32_t rx_crc;
 static volatile enum Command rx_cmd;
 void USART1_IRQHandler() {
-
     uint8_t data = USART1->RDR;
     int isr = USART1->ISR;
     USART1->RQR |= USART_RQR_RXFRQ;
     /* Overrun detected? */
     if (isr & USART_ISR_ORE) {
         USART1->ICR |= USART_ICR_ORECF;
+        asm("bkpt");
         goto errout;
     }
     if (isr & USART_ISR_IDLE) {
         USART1->ICR |= USART_ICR_IDLECF;
         USART1->CR3 &= ~USART_CR3_DMAR_Msk;
         DMA1_Channel3->CCR &= ~DMA_CCR_EN_Msk;
-        protocol_state = PROT_ADDR;
+        DMA1->IFCR |= DMA_IFCR_CGIF3;
+        protocol_state = PROT_ADDR_IDLE;
         USART1->RQR |= USART_RQR_RXFRQ;
         USART1->CR1 |= USART_CR1_RXNEIE;
         return;
     }
 
     switch(protocol_state) {
-    case PROT_ADDR:
-        if (data == bus_addr) /* Are we addressed? */
+    case PROT_ADDR_IDLE:
+    case PROT_ADDR_ERR:
+    case PROT_ADDR_COMPLETE:
+    case PROT_ADDR_CRC:
+    case PROT_ADDR_INIT:
+        if (data == bus_addr) { /* Are we addressed? */
             protocol_state = PROT_CMD;
-        else /* We are not. Mute USART until next idle condition */
+        } else { /* We are not. Mute USART until next idle condition */
+            asm("bkpt");
             goto errout;
+        }
         break;
     case PROT_CMD:
-        if (data > N_CMDS)
+        if (data > N_CMDS) {
+            asm("bkpt");
             goto errout;
+        }
 
         rx_cmd = data;
         crc_reset();
@@ -319,8 +337,9 @@ void USART1_IRQHandler() {
         size_t payload_len = cmd_payload_len[data];
         if (payload_len) {
             /* Is rx_buf currently occupied by the main loop formatting frame data? */
-            if (fb_op != FB_WRITE)
+            /* if (fb_op != FB_WRITE) FIXME DEBUG put this back
                 goto errout;
+                */
             kickoff_uart_rx_dma(&rx_buf, payload_len);
             DMA1_Channel5->CNDTR = payload_len;
             protocol_state = PROT_CRC;
@@ -336,8 +355,12 @@ void USART1_IRQHandler() {
 
     return;
 errout:
-    protocol_state = PROT_ADDR;
+    USART1->CR3 &= ~USART_CR3_DMAR_Msk;
+    DMA1_Channel3->CCR &= ~DMA_CCR_EN_Msk;
+    DMA1->IFCR |= DMA_IFCR_CGIF3;
+    protocol_state = PROT_ADDR_ERR;
     USART1->RQR |= USART_RQR_MMRQ;
+    asm("bkpt");
 }
 
 void DMA1_Channel2_3_IRQHandler() {
@@ -360,7 +383,7 @@ void DMA1_Channel2_3_IRQHandler() {
 
         if (rx_crc != CRC->DR) {
             crc_error_count++;
-            protocol_state = PROT_ADDR;
+            protocol_state = PROT_ADDR_CRC;
             /* re-enable receive interrupt */
             USART1->RQR |= USART_RQR_RXFRQ;
             USART1->RQR |= USART_RQR_MMRQ;
@@ -368,7 +391,7 @@ void DMA1_Channel2_3_IRQHandler() {
             break;
         }
 
-        protocol_state = PROT_ADDR;
+        protocol_state = PROT_ADDR_COMPLETE;
 
         switch(rx_cmd) {
         case CMD_PING:
@@ -477,6 +500,56 @@ void uart_config(void) {
     NVIC_SetPriority(DMA1_Channel4_5_IRQn, 5);
 }
 
+#define ADC_OVERSAMPLING 12
+uint32_t vsense;
+void DMA1_Channel1_IRQHandler(void) {
+    static int count = 0;
+    static uint32_t adc_aggregate[2] = {0, 0};
+
+    DMA1->IFCR |= DMA_IFCR_CGIF1;
+
+    adc_aggregate[0] += adc_buf[0];
+    adc_aggregate[1] += adc_buf[1];
+
+    if (count++ == (1<<ADC_OVERSAMPLING)) {
+        adc_vcc_mv = (3300 * VREFINT_CAL)/(adc_aggregate[0]>>ADC_OVERSAMPLING);
+        vsense = ((adc_aggregate[1]>>ADC_OVERSAMPLING) * adc_vcc_mv)/4095 ;
+        adc_temp_tenth_celsius = 300 - (((TS_CAL1*adc_vcc_mv/4095) - vsense)*100)/43;
+        count = 0;
+        adc_aggregate[0] = 0;
+        adc_aggregate[1] = 0;
+    }
+}
+
+void adc_config(void) {
+    ADC1->CFGR1 = ADC_CFGR1_CONT | ADC_CFGR1_DMAEN | ADC_CFGR1_DMACFG;
+    ADC1->CFGR2 = 2<<ADC_CFGR2_CKMODE_Pos;
+    ADC1->SMPR = 7<<ADC_SMPR_SMP_Pos;
+    ADC1->CHSELR = ADC_CHSELR_CHSEL16 | ADC_CHSELR_CHSEL17;
+    ADC->CCR = ADC_CCR_TSEN | ADC_CCR_VREFEN;
+    ADC1->CR |= ADC_CR_ADCAL;
+    while (ADC1->CR & ADC_CR_ADCAL)
+        ;
+    ADC1->CR |= ADC_CR_ADEN;
+    ADC1->CR |= ADC_CR_ADSTART;
+    /* FIXME handle adc overrun */
+
+    DMA1_Channel1->CPAR = (unsigned int)&ADC1->DR;
+    DMA1_Channel1->CMAR = (unsigned int)&adc_buf;
+    DMA1_Channel1->CNDTR = sizeof(adc_buf)/sizeof(adc_buf[0]);
+    DMA1_Channel1->CCR = (0<<DMA_CCR_PL_Pos);
+    DMA1_Channel1->CCR |=
+          DMA_CCR_CIRC
+        | (1<<DMA_CCR_MSIZE_Pos) /* 16 bit */
+        | (1<<DMA_CCR_PSIZE_Pos) /* 16 bit */
+        | DMA_CCR_MINC
+        | DMA_CCR_TCIE;
+    DMA1_Channel1->CCR |= DMA_CCR_EN;
+
+    NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+    NVIC_SetPriority(DMA1_Channel1_IRQn, 6);
+}
+
 int main(void) {
     RCC->CR |= RCC_CR_HSEON;
     while (!(RCC->CR&RCC_CR_HSERDY));
@@ -490,7 +563,7 @@ int main(void) {
     SystemCoreClockUpdate();
 
     RCC->AHBENR  |= RCC_AHBENR_GPIOAEN | RCC_AHBENR_DMAEN | RCC_AHBENR_CRCEN | RCC_AHBENR_FLITFEN;
-    RCC->APB2ENR |= RCC_APB2ENR_SPI1EN | RCC_APB2ENR_USART1EN | RCC_APB2ENR_SYSCFGEN;
+    RCC->APB2ENR |= RCC_APB2ENR_SPI1EN | RCC_APB2ENR_USART1EN | RCC_APB2ENR_SYSCFGEN | RCC_APB2ENR_ADCEN;
     RCC->APB1ENR |= RCC_APB1ENR_TIM3EN;
 
     GPIOA->MODER |=
@@ -538,6 +611,7 @@ int main(void) {
     cfg_timer3();
     SysTick_Config(SystemCoreClock/1000); /* 1ms interval */
     uart_config();
+    adc_config();
 
     while (42) {
         if (fb_op == FB_FORMAT) {
