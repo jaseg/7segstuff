@@ -239,7 +239,8 @@ enum Command {
     N_CMDS
 };
 
-enum {
+volatile enum {
+    PROT_ZERO_INVALID,
     PROT_ADDR_IDLE,
     PROT_ADDR_ERR,
     PROT_ADDR_COMPLETE,
@@ -305,6 +306,7 @@ void USART1_IRQHandler() {
         USART1->CR3 &= ~USART_CR3_DMAR_Msk;
         DMA1_Channel3->CCR &= ~DMA_CCR_EN_Msk;
         DMA1->IFCR |= DMA_IFCR_CGIF3;
+        NVIC_ClearPendingIRQ(DMA1_Channel2_3_IRQn);
         protocol_state = PROT_ADDR_IDLE;
         USART1->RQR |= USART_RQR_RXFRQ;
         USART1->CR1 |= USART_CR1_RXNEIE;
@@ -340,12 +342,12 @@ void USART1_IRQHandler() {
             /* if (fb_op != FB_WRITE) FIXME DEBUG put this back
                 goto errout;
                 */
-            kickoff_uart_rx_dma(&rx_buf, payload_len);
             DMA1_Channel5->CNDTR = payload_len;
             protocol_state = PROT_CRC;
+            kickoff_uart_rx_dma(&rx_buf, payload_len);
         } else {
-            kickoff_uart_rx_dma(&rx_crc, sizeof(rx_crc));
             protocol_state = PROT_COMPLETE;
+            kickoff_uart_rx_dma(&rx_crc, sizeof(rx_crc));
         }
         break;
     default:
