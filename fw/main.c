@@ -10,6 +10,7 @@
 #include <system_stm32f0xx.h>
 
 #include <stdint.h>
+#include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -18,6 +19,44 @@
 /* 
  * Part number: STM32F030F4C6
  */
+
+typedef struct
+{
+  volatile uint32_t CTRL;                   /*!< Offset: 0x000 (R/W)  Control Register */
+  volatile uint32_t CYCCNT;                 /*!< Offset: 0x004 (R/W)  Cycle Count Register */
+  volatile uint32_t CPICNT;                 /*!< Offset: 0x008 (R/W)  CPI Count Register */
+  volatile uint32_t EXCCNT;                 /*!< Offset: 0x00C (R/W)  Exception Overhead Count Register */
+  volatile uint32_t SLEEPCNT;               /*!< Offset: 0x010 (R/W)  Sleep Count Register */
+  volatile uint32_t LSUCNT;                 /*!< Offset: 0x014 (R/W)  LSU Count Register */
+  volatile uint32_t FOLDCNT;                /*!< Offset: 0x018 (R/W)  Folded-instruction Count Register */
+  volatile uint32_t PCSR;                   /*!< Offset: 0x01C (R/ )  Program Counter Sample Register */
+  volatile uint32_t COMP0;                  /*!< Offset: 0x020 (R/W)  Comparator Register 0 */
+  volatile uint32_t MASK0;                  /*!< Offset: 0x024 (R/W)  Mask Register 0 */
+  volatile uint32_t FUNCTION0;              /*!< Offset: 0x028 (R/W)  Function Register 0 */
+           uint32_t RESERVED0[1];
+  volatile uint32_t COMP1;                  /*!< Offset: 0x030 (R/W)  Comparator Register 1 */
+  volatile uint32_t MASK1;                  /*!< Offset: 0x034 (R/W)  Mask Register 1 */
+  volatile uint32_t FUNCTION1;              /*!< Offset: 0x038 (R/W)  Function Register 1 */
+           uint32_t RESERVED1[1];
+} DWT_Type;
+
+#define DWT ((DWT_Type *)0xE0001000)
+DWT_Type *dwt = DWT;
+
+void dwt0_configure(volatile void *addr) {
+    dwt->COMP0 = (uint32_t)addr;
+    dwt->MASK0 = 0;
+}
+
+enum DWT_Function {
+    DWT_R = 5,
+    DWT_W = 6,
+    DWT_RW = 7
+};
+
+void dwt0_enable(enum DWT_Function function) {
+    dwt->FUNCTION0 = function;
+}
 
 /* Wait for about 0.2us */
 static void tick(void) {
@@ -239,47 +278,21 @@ enum Command {
     N_CMDS
 };
 
-volatile enum {
+enum ProtocolState {
     PROT_ZERO_INVALID,
-    PROT_ADDR_IDLE,
-    PROT_ADDR_ERR,
-    PROT_ADDR_COMPLETE,
-    PROT_ADDR_CRC,
-    PROT_ADDR_INIT,
-    PROT_CMD,
-    PROT_CRC,
-    PROT_COMPLETE,
-    PROT_INVALID,
-    N_PROT_STATES
-} protocol_state = PROT_ADDR_INIT;
+    PROT_USART_ADDR_IDLE,
+    PROT_USART_ADDR_ERR,
+    PROT_USART_ADDR_COMPLETE,
+    PROT_USART_ADDR_CRC,
+    PROT_USART_ADDR_INIT,
+    PROT_USART_CMD,
+    PROT_DMA_INVALID=0x8,
+    PROT_DMA_CRC,
+    PROT_DMA_COMPLETE_USART,
+    PROT_DMA_COMPLETE_DMA,
+};
 
-void crc_reset(void) {
-    CRC->CR |= CRC_CR_RESET;
-    while (CRC->CR&CRC_CR_RESET)
-        ;
-}
-
-void crc_feed(uint8_t data) {
-    *(uint8_t *)&CRC->DR = data;
-}
-
-void kickoff_uart_rx_dma(volatile void *target, size_t len) {
-    DMA1_Channel3->CMAR = (unsigned int)target;
-    DMA1_Channel3->CNDTR = len;
-    /* Disable RX interrupt for duration of DMA transfer */
-    USART1->CR1 &= ~USART_CR1_RXNEIE_Msk;
-    /* Enable DMA transfer to write buffer */
-    DMA1->IFCR |= DMA_IFCR_CGIF3;
-    DMA1_Channel3->CCR |= DMA_CCR_EN;
-    USART1->CR3 |= USART_CR3_DMAR;
-}
-
-void kickoff_uart_tx_dma(size_t len) {
-    DMA1_Channel4->CNDTR = len;
-    USART1->ICR |= USART_ICR_TCCF; /* FIXME: (1) is this necessary? (2) where should this be done? */
-    DMA1_Channel4->CCR |= DMA_CCR_EN;
-    USART1->RQR |= USART_RQR_MMRQ;
-}
+volatile enum ProtocolState protocol_state = PROT_USART_ADDR_INIT;
 
 static size_t cmd_payload_len[N_CMDS] = {
     [CMD_PING]          = 0,
@@ -291,42 +304,124 @@ static size_t cmd_payload_len[N_CMDS] = {
 int crc_error_count = 0;
 static volatile uint32_t rx_crc;
 static volatile enum Command rx_cmd;
+static volatile size_t payload_len;
+
+bool dma_ch3_is_enabled(void) {
+    return DMA1_Channel3->CCR & DMA_CCR_EN;
+}
+
+void kickoff_uart_rx_dma(volatile void *target, size_t len, enum ProtocolState state) {
+    /* This may be called from both DMA or USART ISRs. DMA channel 3 is disabled
+     * at this point. */
+    if (dma_ch3_is_enabled())
+        asm("bkpt");
+    protocol_state = state;                     /* Finally, switch state */
+    USART1->CR1 |= USART_CR1_IDLEIE;            /* Enable USART IDLE interrupt */
+    DMA1_Channel3->CMAR = (unsigned int)target; /* Set memory address */
+    DMA1_Channel3->CNDTR = len;                 /* Set transfer count */
+    USART1->CR1 &= ~USART_CR1_RXNEIE_Msk;       /* Disable RX interrupt for duration of DMA transfer */
+    DMA1->IFCR |= DMA_IFCR_CGIF3;               /* Clear DMA channel 3 interrupt flag */
+    DMA1_Channel3->CCR |= DMA_CCR_EN;           /* Enable DMA transfer to write buffer */
+    USART1->CR3 |= USART_CR3_DMAR;              /* Enable USART-side of DMA channel 3 */
+}
+
+void disable_dma_ch3(void) {
+    /* May also be called with DMA ch3 already disabled */
+    USART1->CR3 &= ~USART_CR3_DMAR_Msk;
+    DMA1_Channel3->CCR &= ~DMA_CCR_EN_Msk;
+    DMA1->IFCR |= DMA_IFCR_CGIF3;
+    /* This may be called from USART IRQ handler */
+    NVIC_ClearPendingIRQ(DMA1_Channel2_3_IRQn);
+}
+
+void kickoff_uart_tx_dma(size_t len) {
+    DMA1_Channel4->CNDTR = len;
+    USART1->ICR |= USART_ICR_TCCF; /* FIXME: (1) is this necessary? (2) where should this be done? */
+    DMA1_Channel4->CCR |= DMA_CCR_EN;
+    USART1->RQR |= USART_RQR_MMRQ;
+}
+
+void kickoff_crc_dma(void) {
+    DMA1_Channel5->CNDTR = payload_len;
+    DMA1_Channel5->CCR |= DMA_CCR_EN;
+}
+
+void disable_crc_dma(void) {
+    DMA1_Channel5->CCR &= ~DMA_CCR_EN_Msk;
+    DMA1->IFCR |= DMA_IFCR_CGIF5;
+}
+
+void state_simple(enum ProtocolState state) { protocol_state = state; }
+void state_usart_usart(enum ProtocolState state) { state_simple(state); }
+void state_dma_dma(enum ProtocolState state) { state_simple(state); }
+
+void state_dma_usart(enum ProtocolState state) {
+    /* At this point the DMA channel has already been disabled. */
+    if (DMA1_Channel3->CCR & DMA_CCR_EN)
+        asm("bkpt");
+    USART1->RQR |= USART_RQR_RXFRQ;         /* Clear receive flag FIXME necessary? */
+    USART1->CR1 &= ~USART_CR1_IDLEIE_Msk;   /* Disable IDLE interrupt */
+    USART1->CR1 |= USART_CR1_RXNEIE;        /* Enable receive interrupt */
+    protocol_state = state;                 /* Finally, switch state */
+}
+
+void usart_mute(void) {
+    USART1->RQR |= USART_RQR_MMRQ;
+}
+
+void usart_abort_dma(void) {
+    /* May also be called with DMA ch3 already disabled */
+    disable_dma_ch3();
+    state_dma_usart(PROT_USART_ADDR_IDLE);
+    usart_mute();
+}
+
+void crc_reset(void) {
+    CRC->CR |= CRC_CR_RESET;
+    while (CRC->CR&CRC_CR_RESET)
+        ;
+}
+
+void crc_feed(uint8_t data) {
+    *(uint8_t *)&CRC->DR = data;
+}
+
 void USART1_IRQHandler() {
-    uint8_t data = USART1->RDR;
     int isr = USART1->ISR;
     USART1->RQR |= USART_RQR_RXFRQ;
     /* Overrun detected? */
     if (isr & USART_ISR_ORE) {
-        USART1->ICR |= USART_ICR_ORECF;
+        USART1->ICR |= USART_ICR_ORECF; /* Acknowledge overrun */
         asm("bkpt");
         goto errout;
     }
-    if (isr & USART_ISR_IDLE) {
-        USART1->ICR |= USART_ICR_IDLECF;
-        USART1->CR3 &= ~USART_CR3_DMAR_Msk;
-        DMA1_Channel3->CCR &= ~DMA_CCR_EN_Msk;
-        DMA1->IFCR |= DMA_IFCR_CGIF3;
-        NVIC_ClearPendingIRQ(DMA1_Channel2_3_IRQn);
-        protocol_state = PROT_ADDR_IDLE;
-        USART1->RQR |= USART_RQR_RXFRQ;
-        USART1->CR1 |= USART_CR1_RXNEIE;
-        return;
+
+    if (dma_ch3_is_enabled() && (isr & USART_ISR_IDLE)) {
+        USART1->ICR |= USART_ICR_IDLECF; /* Acknowledge idle condition */
+        /* We may or may not be in DMA mode now */
+        /* asm("bkpt"); FIXME debug when this should happen and when not and
+         * handle this appropriately */
+        goto errout;
     }
 
+    if (!(isr & USART_ISR_RXNE))
+        asm("bkpt");
+    uint8_t data = USART1->RDR;
     switch(protocol_state) {
-    case PROT_ADDR_IDLE:
-    case PROT_ADDR_ERR:
-    case PROT_ADDR_COMPLETE:
-    case PROT_ADDR_CRC:
-    case PROT_ADDR_INIT:
+    case PROT_USART_ADDR_IDLE:
+    case PROT_USART_ADDR_ERR:
+    case PROT_USART_ADDR_COMPLETE:
+    case PROT_USART_ADDR_CRC:
+    case PROT_USART_ADDR_INIT:
         if (data == bus_addr) { /* Are we addressed? */
-            protocol_state = PROT_CMD;
+            state_usart_usart(PROT_USART_CMD);
         } else { /* We are not. Mute USART until next idle condition */
             asm("bkpt");
+            usart_mute();
             goto errout;
         }
         break;
-    case PROT_CMD:
+    case PROT_USART_CMD:
         if (data > N_CMDS) {
             asm("bkpt");
             goto errout;
@@ -336,18 +431,16 @@ void USART1_IRQHandler() {
         crc_reset();
         crc_feed(data);
 
-        size_t payload_len = cmd_payload_len[data];
-        if (payload_len) {
+        size_t len = cmd_payload_len[data];
+        payload_len = len;
+        if (len) {
             /* Is rx_buf currently occupied by the main loop formatting frame data? */
             /* if (fb_op != FB_WRITE) FIXME DEBUG put this back
                 goto errout;
                 */
-            DMA1_Channel5->CNDTR = payload_len;
-            protocol_state = PROT_CRC;
-            kickoff_uart_rx_dma(&rx_buf, payload_len);
+            kickoff_uart_rx_dma(&rx_buf, len, PROT_DMA_CRC);
         } else {
-            protocol_state = PROT_COMPLETE;
-            kickoff_uart_rx_dma(&rx_crc, sizeof(rx_crc));
+            kickoff_uart_rx_dma(&rx_crc, sizeof(rx_crc), PROT_DMA_COMPLETE_USART);
         }
         break;
     default:
@@ -357,43 +450,29 @@ void USART1_IRQHandler() {
 
     return;
 errout:
-    USART1->CR3 &= ~USART_CR3_DMAR_Msk;
-    DMA1_Channel3->CCR &= ~DMA_CCR_EN_Msk;
-    DMA1->IFCR |= DMA_IFCR_CGIF3;
-    protocol_state = PROT_ADDR_ERR;
-    USART1->RQR |= USART_RQR_MMRQ;
-    asm("bkpt");
+    /* We may or may not be in DMA mode now */
+    usart_abort_dma();
 }
 
 void DMA1_Channel2_3_IRQHandler() {
     /* DMA Transfer complete */
-    /* Disable this DMA channel */
-    USART1->CR3 &= ~USART_CR3_DMAR_Msk;
-    DMA1_Channel3->CCR &= ~DMA_CCR_EN_Msk;
-    DMA1->IFCR |= DMA_IFCR_CGIF3;
+    disable_dma_ch3();
 
     switch(protocol_state) {
-    case PROT_CRC:
-        kickoff_uart_rx_dma(&rx_crc, sizeof(rx_crc));
-        protocol_state = PROT_COMPLETE;
-
-        DMA1_Channel5->CCR |= DMA_CCR_EN;
+    case PROT_DMA_CRC:
+        kickoff_uart_rx_dma(&rx_crc, sizeof(rx_crc), PROT_DMA_COMPLETE_DMA);
+        state_dma_dma(PROT_DMA_COMPLETE_DMA);
+        kickoff_crc_dma();
         break;
-    case PROT_COMPLETE:
-        DMA1_Channel5->CCR &= ~DMA_CCR_EN_Msk;
-        DMA1->IFCR |= DMA_IFCR_CGIF5;
+    case PROT_DMA_COMPLETE_USART:
+    case PROT_DMA_COMPLETE_DMA:
+        disable_crc_dma(); /* May or may not be enabled. Should long be done by now if enabled */
 
         if (rx_crc != CRC->DR) {
             crc_error_count++;
-            protocol_state = PROT_ADDR_CRC;
-            /* re-enable receive interrupt */
-            USART1->RQR |= USART_RQR_RXFRQ;
-            USART1->RQR |= USART_RQR_MMRQ;
-            USART1->CR1 |= USART_CR1_RXNEIE;
+            state_dma_usart(PROT_USART_ADDR_CRC);
             break;
         }
-
-        protocol_state = PROT_ADDR_COMPLETE;
 
         switch(rx_cmd) {
         case CMD_PING:
@@ -416,16 +495,14 @@ void DMA1_Channel2_3_IRQHandler() {
             tx_buf.desc_reply.temp_tenth_celsius = adc_temp_tenth_celsius;
             tx_buf.desc_reply.nbits = nbits;
             tx_buf.desc_reply.millifps = frame_duration_us > 0 ? 1000000000 / frame_duration_us : 0;
-            kickoff_uart_tx_dma(sizeof(tx_buf.desc_reply));
+            kickoff_uart_tx_dma(sizeof(tx_buf.desc_reply)); /* Will turn itself off automatically */
             break;
         default:
             /* can/must not happen */
             asm("bkpt");
         }
 
-        /* re-enable receive interrupt */
-        USART1->RQR |= USART_RQR_RXFRQ;
-        USART1->CR1 |= USART_CR1_RXNEIE;
+        state_dma_usart(PROT_USART_ADDR_COMPLETE);
         break;
     default:
         /* can/must not happen */
@@ -434,6 +511,10 @@ void DMA1_Channel2_3_IRQHandler() {
 }
 
 void DMA1_Channel4_5_IRQHandler() {
+    /* Handles only channel 4 (the transmit DMA channel). Channel 5 (receive
+     * CRC) is left free-running without interrupt service.
+     *
+     * Turn off this channel. */
     DMA1->IFCR |= DMA_IFCR_CGIF4;
     DMA1_Channel4->CCR &= ~DMA_CCR_EN_Msk;
 }
@@ -449,7 +530,6 @@ void uart_config(void) {
         /* WAKE clear */
         /* PCE, PS clear */
         | USART_CR1_RXNEIE
-        | USART_CR1_IDLEIE
         /* other interrupts clear */
         | USART_CR1_TE
         | USART_CR1_RE;
@@ -495,11 +575,13 @@ void uart_config(void) {
     SYSCFG->CFGR1 |= SYSCFG_CFGR1_USART1TX_DMA_RMP;
 
     NVIC_EnableIRQ(USART1_IRQn);
-    NVIC_SetPriority(USART1_IRQn, 4);
+    NVIC_SetPriority(USART1_IRQn, 2);
+    /* For channel 3 only */
     NVIC_EnableIRQ(DMA1_Channel2_3_IRQn);
-    NVIC_SetPriority(DMA1_Channel2_3_IRQn, 3);
+    NVIC_SetPriority(DMA1_Channel2_3_IRQn, 2);
+    /* For channel 4 only */
     NVIC_EnableIRQ(DMA1_Channel4_5_IRQn);
-    NVIC_SetPriority(DMA1_Channel4_5_IRQn, 5);
+    NVIC_SetPriority(DMA1_Channel4_5_IRQn, 3);
 }
 
 #define ADC_OVERSAMPLING 12
@@ -565,7 +647,7 @@ int main(void) {
     SystemCoreClockUpdate();
 
     RCC->AHBENR  |= RCC_AHBENR_GPIOAEN | RCC_AHBENR_DMAEN | RCC_AHBENR_CRCEN | RCC_AHBENR_FLITFEN;
-    RCC->APB2ENR |= RCC_APB2ENR_SPI1EN | RCC_APB2ENR_USART1EN | RCC_APB2ENR_SYSCFGEN | RCC_APB2ENR_ADCEN;
+    RCC->APB2ENR |= RCC_APB2ENR_SPI1EN | RCC_APB2ENR_USART1EN | RCC_APB2ENR_SYSCFGEN | RCC_APB2ENR_ADCEN | RCC_APB2ENR_DBGMCUEN;
     RCC->APB1ENR |= RCC_APB1ENR_TIM3EN;
 
     GPIOA->MODER |=
