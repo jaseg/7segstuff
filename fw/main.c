@@ -99,10 +99,10 @@ volatile unsigned int sys_time_seconds = 0;
 volatile struct framebuf fb[2] = {0};
 volatile struct framebuf *read_fb=fb+0, *write_fb=fb+1;
 volatile int led_state = 0;
-volatile enum { FB_WRITE, FB_FORMAT, FB_UPDATE } fb_op;
+volatile enum { FB_WRITE, FB_UPDATE } fb_op = FB_WRITE;
 volatile union {
-    struct __attribute__((packed)) { struct framebuf fb;            } set_fb_rq;
-    struct __attribute__((packed)) { uint8_t nbits;                 } set_nbits_rq;
+    struct __attribute__((packed)) { struct framebuf fb; uint8_t end[0]; } set_fb_rq;
+    struct __attribute__((packed)) { uint8_t nbits;      uint8_t end[0]; } set_nbits_rq;
     uint8_t byte_data[0];
 } rx_buf;
 
@@ -278,246 +278,17 @@ enum Command {
     N_CMDS
 };
 
-enum ProtocolState {
-    PROT_ZERO_INVALID,
-    PROT_USART_ADDR_IDLE,
-    PROT_USART_ADDR_ERR,
-    PROT_USART_ADDR_COMPLETE,
-    PROT_USART_ADDR_CRC,
-    PROT_USART_ADDR_INIT,
-    PROT_USART_CMD,
-    PROT_DMA_INVALID=0x8,
-    PROT_DMA_CRC,
-    PROT_DMA_COMPLETE_USART,
-    PROT_DMA_COMPLETE_DMA,
-};
-
-volatile enum ProtocolState protocol_state = PROT_USART_ADDR_INIT;
-
-static size_t cmd_payload_len[N_CMDS] = {
-    [CMD_PING]          = 0,
-    [CMD_SET_FB]        = sizeof(rx_buf.set_fb_rq),
-    [CMD_SET_NBITS]     = sizeof(rx_buf.set_nbits_rq),
-    [CMD_GET_DESC]      = 0,
-};
-
-int crc_error_count = 0;
-static volatile uint32_t rx_crc;
-static volatile enum Command rx_cmd;
-static volatile size_t payload_len;
-
-bool dma_ch3_is_enabled(void) {
-    return DMA1_Channel3->CCR & DMA_CCR_EN;
-}
-
-void kickoff_uart_rx_dma(volatile void *target, size_t len, enum ProtocolState state) {
-    /* This may be called from both DMA or USART ISRs. DMA channel 3 is disabled
-     * at this point. */
-    if (dma_ch3_is_enabled())
-        asm("bkpt");
-    protocol_state = state;                     /* Finally, switch state */
-    USART1->CR1 |= USART_CR1_IDLEIE;            /* Enable USART IDLE interrupt */
-    DMA1_Channel3->CMAR = (unsigned int)target; /* Set memory address */
-    DMA1_Channel3->CNDTR = len;                 /* Set transfer count */
-    USART1->CR1 &= ~USART_CR1_RXNEIE_Msk;       /* Disable RX interrupt for duration of DMA transfer */
-    DMA1->IFCR |= DMA_IFCR_CGIF3;               /* Clear DMA channel 3 interrupt flag */
-    DMA1_Channel3->CCR |= DMA_CCR_EN;           /* Enable DMA transfer to write buffer */
-    USART1->CR3 |= USART_CR3_DMAR;              /* Enable USART-side of DMA channel 3 */
-}
-
-void disable_dma_ch3(void) {
-    /* May also be called with DMA ch3 already disabled */
-    USART1->CR3 &= ~USART_CR3_DMAR_Msk;
-    DMA1_Channel3->CCR &= ~DMA_CCR_EN_Msk;
-    DMA1->IFCR |= DMA_IFCR_CGIF3;
-    /* This may be called from USART IRQ handler */
-    NVIC_ClearPendingIRQ(DMA1_Channel2_3_IRQn);
-}
-
-void kickoff_uart_tx_dma(size_t len) {
-    DMA1_Channel4->CNDTR = len;
-    USART1->ICR |= USART_ICR_TCCF; /* FIXME: (1) is this necessary? (2) where should this be done? */
-    DMA1_Channel4->CCR |= DMA_CCR_EN;
-    USART1->RQR |= USART_RQR_MMRQ;
-}
-
-void kickoff_crc_dma(void) {
-    DMA1_Channel5->CNDTR = payload_len;
-    DMA1_Channel5->CCR |= DMA_CCR_EN;
-}
-
-void disable_crc_dma(void) {
-    DMA1_Channel5->CCR &= ~DMA_CCR_EN_Msk;
-    DMA1->IFCR |= DMA_IFCR_CGIF5;
-}
-
-void state_simple(enum ProtocolState state) { protocol_state = state; }
-void state_usart_usart(enum ProtocolState state) { state_simple(state); }
-void state_dma_dma(enum ProtocolState state) { state_simple(state); }
-
-void state_dma_usart(enum ProtocolState state) {
-    /* At this point the DMA channel has already been disabled. */
-    if (DMA1_Channel3->CCR & DMA_CCR_EN)
-        asm("bkpt");
-    USART1->RQR |= USART_RQR_RXFRQ;         /* Clear receive flag FIXME necessary? */
-    USART1->CR1 &= ~USART_CR1_IDLEIE_Msk;   /* Disable IDLE interrupt */
-    USART1->CR1 |= USART_CR1_RXNEIE;        /* Enable receive interrupt */
-    protocol_state = state;                 /* Finally, switch state */
-}
-
-void usart_mute(void) {
-    USART1->RQR |= USART_RQR_MMRQ;
-}
-
-void usart_abort_dma(void) {
-    /* May also be called with DMA ch3 already disabled */
-    disable_dma_ch3();
-    state_dma_usart(PROT_USART_ADDR_IDLE);
-    usart_mute();
-}
-
-void crc_reset(void) {
-    CRC->CR |= CRC_CR_RESET;
-    while (CRC->CR&CRC_CR_RESET)
-        ;
-}
-
-void crc_feed(uint8_t data) {
-    *(uint8_t *)&CRC->DR = data;
-}
-
-void USART1_IRQHandler() {
-    int isr = USART1->ISR;
-    USART1->RQR |= USART_RQR_RXFRQ;
-    /* Overrun detected? */
-    if (isr & USART_ISR_ORE) {
-        USART1->ICR |= USART_ICR_ORECF; /* Acknowledge overrun */
-        asm("bkpt");
-        goto errout;
-    }
-
-    if (dma_ch3_is_enabled() && (isr & USART_ISR_IDLE)) {
-        USART1->ICR |= USART_ICR_IDLECF; /* Acknowledge idle condition */
-        /* We may or may not be in DMA mode now */
-        /* asm("bkpt"); FIXME debug when this should happen and when not and
-         * handle this appropriately */
-        goto errout;
-    }
-
-    if (!(isr & USART_ISR_RXNE))
-        asm("bkpt");
-    uint8_t data = USART1->RDR;
-    switch(protocol_state) {
-    case PROT_USART_ADDR_IDLE:
-    case PROT_USART_ADDR_ERR:
-    case PROT_USART_ADDR_COMPLETE:
-    case PROT_USART_ADDR_CRC:
-    case PROT_USART_ADDR_INIT:
-        if (data == bus_addr) { /* Are we addressed? */
-            state_usart_usart(PROT_USART_CMD);
-        } else { /* We are not. Mute USART until next idle condition */
-            asm("bkpt");
-            usart_mute();
-            goto errout;
-        }
-        break;
-    case PROT_USART_CMD:
-        if (data > N_CMDS) {
-            asm("bkpt");
-            goto errout;
-        }
-
-        rx_cmd = data;
-        crc_reset();
-        crc_feed(data);
-
-        size_t len = cmd_payload_len[data];
-        payload_len = len;
-        if (len) {
-            /* Is rx_buf currently occupied by the main loop formatting frame data? */
-            /* if (fb_op != FB_WRITE) FIXME DEBUG put this back
-                goto errout;
-                */
-            kickoff_uart_rx_dma(&rx_buf, len, PROT_DMA_CRC);
-        } else {
-            kickoff_uart_rx_dma(&rx_crc, sizeof(rx_crc), PROT_DMA_COMPLETE_USART);
-        }
-        break;
-    default:
-        /* can/must not happen */
-        asm("bkpt");
-    }
-
-    return;
-errout:
-    /* We may or may not be in DMA mode now */
-    usart_abort_dma();
-}
-
-void DMA1_Channel2_3_IRQHandler() {
-    /* DMA Transfer complete */
-    disable_dma_ch3();
-
-    switch(protocol_state) {
-    case PROT_DMA_CRC:
-        kickoff_uart_rx_dma(&rx_crc, sizeof(rx_crc), PROT_DMA_COMPLETE_DMA);
-        state_dma_dma(PROT_DMA_COMPLETE_DMA);
-        kickoff_crc_dma();
-        break;
-    case PROT_DMA_COMPLETE_USART:
-    case PROT_DMA_COMPLETE_DMA:
-        disable_crc_dma(); /* May or may not be enabled. Should long be done by now if enabled */
-
-        if (rx_crc != CRC->DR) {
-            crc_error_count++;
-            state_dma_usart(PROT_USART_ADDR_CRC);
-            break;
-        }
-
-        switch(rx_cmd) {
-        case CMD_PING:
-            tx_buf.ping_reply.magic = 0x39404142;
-            kickoff_uart_tx_dma(sizeof(tx_buf.ping_reply));
-            break;;
-        case CMD_SET_FB:
-            fb_op = FB_UPDATE;
-            break;
-        case CMD_SET_NBITS:
-            nbits = rx_buf.set_nbits_rq.nbits;
-            break;
-        case CMD_GET_DESC:
-            tx_buf.desc_reply.firmware_version = FIRMWARE_VERSION;
-            tx_buf.desc_reply.hardware_version = HARDWARE_VERSION;
-            tx_buf.desc_reply.digit_rows = NROWS;
-            tx_buf.desc_reply.digit_cols = NCOLS;
-            tx_buf.desc_reply.uptime = sys_time_seconds;
-            tx_buf.desc_reply.vcc_mv = adc_vcc_mv;
-            tx_buf.desc_reply.temp_tenth_celsius = adc_temp_tenth_celsius;
-            tx_buf.desc_reply.nbits = nbits;
-            tx_buf.desc_reply.millifps = frame_duration_us > 0 ? 1000000000 / frame_duration_us : 0;
-            kickoff_uart_tx_dma(sizeof(tx_buf.desc_reply)); /* Will turn itself off automatically */
-            break;
-        default:
-            /* can/must not happen */
-            asm("bkpt");
-        }
-
-        state_dma_usart(PROT_USART_ADDR_COMPLETE);
-        break;
-    default:
-        /* can/must not happen */
-        asm("bkpt");
-    }
-}
-
-void DMA1_Channel4_5_IRQHandler() {
-    /* Handles only channel 4 (the transmit DMA channel). Channel 5 (receive
-     * CRC) is left free-running without interrupt service.
-     *
-     * Turn off this channel. */
-    DMA1->IFCR |= DMA_IFCR_CGIF4;
-    DMA1_Channel4->CCR &= ~DMA_CCR_EN_Msk;
-}
+/*
+    tx_buf.desc_reply.firmware_version = FIRMWARE_VERSION;
+    tx_buf.desc_reply.hardware_version = HARDWARE_VERSION;
+    tx_buf.desc_reply.digit_rows = NROWS;
+    tx_buf.desc_reply.digit_cols = NCOLS;
+    tx_buf.desc_reply.uptime = sys_time_seconds;
+    tx_buf.desc_reply.vcc_mv = adc_vcc_mv;
+    tx_buf.desc_reply.temp_tenth_celsius = adc_temp_tenth_celsius;
+    tx_buf.desc_reply.nbits = nbits;
+    tx_buf.desc_reply.millifps = frame_duration_us > 0 ? 1000000000 / frame_duration_us : 0;
+*/
 
 void uart_config(void) {
     USART1->CR1 = /* 8-bit -> M1, M0 clear */
@@ -529,59 +300,17 @@ void uart_config(void) {
         | USART_CR1_MME
         /* WAKE clear */
         /* PCE, PS clear */
-        | USART_CR1_RXNEIE
+        //| USART_CR1_RXNEIE
         /* other interrupts clear */
         | USART_CR1_TE
         | USART_CR1_RE;
     //USART1->CR2 = USART_CR2_RTOEN; /* Timeout enable */
-    USART1->CR3 = USART_CR3_DEM /* RS485 DE enable (output on RTS) */
-            | USART_CR3_DMAT;
+    USART1->CR3 = USART_CR3_DEM; /* RS485 DE enable (output on RTS) */
+            //| USART_CR3_DMAT;
+    /* Baud rate 2MBd */
     int usartdiv = 25;
     USART1->BRR = usartdiv;
     USART1->CR1 |= USART_CR1_UE;
-
-    /* Configure DMA 1 / Channel 3 for USART frame data reception: USART1->RDR -> rx_buf */
-    DMA1_Channel3->CPAR = (unsigned int)&USART1->RDR;
-    DMA1_Channel3->CCR = (1<<DMA_CCR_PL_Pos);
-    DMA1_Channel3->CCR |=
-          (0<<DMA_CCR_MSIZE_Pos) /* 8 bit */
-        | (0<<DMA_CCR_PSIZE_Pos) /* 8 bit */
-        | DMA_CCR_MINC
-        | DMA_CCR_TCIE
-        | DMA_CCR_CIRC;
-
-    /* Configure DMA 1 / Channel 5 for USART frame data CRC check: rx_buf -> CRC->DR */
-    DMA1_Channel5->CPAR = (unsigned int)&CRC->DR;
-    DMA1_Channel5->CMAR = (unsigned int)&rx_buf;
-    DMA1_Channel5->CCR = (0<<DMA_CCR_PL_Pos);
-    DMA1_Channel5->CCR |=
-          DMA_CCR_MEM2MEM /* Software trigger (precludes CIRC) */
-        | DMA_CCR_DIR /* Read from memory */
-        | (0<<DMA_CCR_MSIZE_Pos) /* 8 bit */
-        | (0<<DMA_CCR_PSIZE_Pos) /* 8 bit */
-        | DMA_CCR_MINC;
-
-    /* Configure DMA 1 / Channel 4 for USART reply transmission */
-    DMA1_Channel4->CPAR = (unsigned int)&USART1->TDR;
-    DMA1_Channel4->CMAR = (unsigned int)&tx_buf;
-    DMA1_Channel4->CCR = (0<<DMA_CCR_PL_Pos);
-    DMA1_Channel4->CCR |=
-          DMA_CCR_DIR /* Read from memory */
-        | (0<<DMA_CCR_MSIZE_Pos) /* 8 bit */
-        | (0<<DMA_CCR_PSIZE_Pos) /* 8 bit */
-        | DMA_CCR_MINC
-        | DMA_CCR_TCIE;
-    
-    SYSCFG->CFGR1 |= SYSCFG_CFGR1_USART1TX_DMA_RMP;
-
-    NVIC_EnableIRQ(USART1_IRQn);
-    NVIC_SetPriority(USART1_IRQn, 2);
-    /* For channel 3 only */
-    NVIC_EnableIRQ(DMA1_Channel2_3_IRQn);
-    NVIC_SetPriority(DMA1_Channel2_3_IRQn, 2);
-    /* For channel 4 only */
-    NVIC_EnableIRQ(DMA1_Channel4_5_IRQn);
-    NVIC_SetPriority(DMA1_Channel4_5_IRQn, 3);
 }
 
 #define ADC_OVERSAMPLING 12
@@ -695,15 +424,43 @@ int main(void) {
     cfg_timer3();
     SysTick_Config(SystemCoreClock/1000); /* 1ms interval */
     uart_config();
-    adc_config();
+    //adc_config();
 
+    int rx_idx = 0;
+    int expect_framing = 1;
+    uint8_t data;
+    unsigned int num_overrun_errors = 0;
+    /* FIXME document framing/rx state machine */
     while (42) {
-        if (fb_op == FB_FORMAT) {
-            transpose_data(rx_buf.byte_data, write_fb);
-
-            fb_op = FB_UPDATE;
-            while (fb_op == FB_UPDATE)
-                ;
+        if (USART1->ISR & USART_ISR_ORE) {
+            USART1->ICR |= USART_ICR_ORECF;
+            num_overrun_errors ++;
+        } else if (USART1->ISR & USART_ISR_FE) {
+            USART1->ICR |= USART_ICR_FECF;
+        } else if (USART1->ISR & USART_ISR_RXNE) {
+            data = USART1->RDR;
+            /*
+            if (expect_framing) {
+                if (data == 0x42) {
+                    expect_framing = 0;
+                } else {
+                    rx_idx = 0;
+                }
+            } else {
+                rx_buf.byte_data[rx_idx] = data;
+                rx_idx++;
+                if (rx_idx >= sizeof(rx_buf.set_fb_rq)) {
+                    rx_idx = 0;
+                    if (fb_op == FB_WRITE) {
+                        transpose_data(rx_buf.byte_data, write_fb);
+                        fb_op = FB_UPDATE;
+                    }
+                }
+                if ((rx_idx&0x1F) == 0) {
+                    expect_framing = 1;
+                }
+            }
+            */
         }
     }
 }
@@ -729,6 +486,6 @@ void SysTick_Handler(void) {
     if (n++ == 1000) {
         n = 0;
         sys_time_seconds++;
-    }
+}
 }
 
