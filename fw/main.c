@@ -350,9 +350,12 @@ void uart_config(void) {
 
 static unsigned int overruns = 0;
 static unsigned int frame_overruns = 0;
+#define SYNC_LENGTH 32 /* Must be a power of two */
 void USART1_IRQHandler(void) {
     static uint8_t expect_framing = 1;
     static int rxpos = 0;
+    static int resync = SYNC_LENGTH+1;
+    static int sync_chars = 0;
 
     GPIOA->BSRR = GPIO_BSRR_BS_0; // Debug
 
@@ -364,16 +367,27 @@ void USART1_IRQHandler(void) {
         USART1->ICR = USART_ICR_ORECF;
     } else { /* RXNE */
         uint8_t data = USART1->RDR;
-        if (expect_framing) {
+
+        if (data == 0x23)
+            sync_chars++;
+        else
+            sync_chars = 0;
+
+        if (resync) {
+            if (sync_chars == SYNC_LENGTH+1) {
+                resync = 0;
+            }
+        } else if (expect_framing) {
             if (data == 0x42) {
                 expect_framing = 0;
             } else {
                 rxpos = 0;
+                resync = 1;
             }
         } else {
             rx_buf.byte_data[rxpos] = data;
             rxpos++;
-            if ((rxpos&0x1F) == 0) {
+            if ((rxpos&(SYNC_LENGTH-1)) == 0) {
                 expect_framing = 1;
             }
             if (rxpos >= sizeof(rx_buf.set_fb_rq)) {
@@ -524,6 +538,10 @@ int main(void) {
             led_state = (led_state+1)&7;
         }
         if (fb_op == FB_FORMAT) {
+            for (int i=0; i<sizeof(rx_buf.set_fb_rq); i++) {
+                if (rx_buf.byte_data[i] == 0x42)
+                    asm("bkpt");
+            }
             transpose_data(rx_buf.byte_data, write_fb);
             fb_op = FB_UPDATE;
         }
