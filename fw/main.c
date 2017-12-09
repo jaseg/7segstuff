@@ -167,63 +167,20 @@ uint8_t segment_map[8] = {5, 7, 6, 4, 1, 3, 0, 2};
 static volatile uint32_t aux_reg = 0;
 static volatile int frame_duration_us;
 volatile int nbits = MAX_BITS;
-/* returns new bit time in cycles */
-int shift_data() {
-    static int active_segment = 0;
-    static unsigned int active_bit = 0;
-    static unsigned int last_frame_time;
 
-    /* Note: On boot, multiplexing will start with bit 1 due to the next few lines. This is perfectly ok. */
-    active_bit++;
-    if (active_bit >= nbits) {
-        active_bit = 0;
-
-        active_segment++;
-        if (active_segment == NSEGMENTS) {
-            active_segment = 0;
-
-            /* FIXME remove this?
-            int time = stk_microseconds();
-            frame_duration_us = time - last_frame_time;
-            last_frame_time = time;
-            */
-            if (fb_op == FB_UPDATE) {
-                volatile struct framebuf *tmp = read_fb;
-                read_fb = write_fb;
-                write_fb = tmp;
-                fb_op = FB_WRITE;
-            }
-        }
-
-        GPIOA->BSRR = GPIO_BSRR_BR_10;
-        SPI1->DR = aux_reg | segment_map[active_segment];
-        while (SPI1->SR & SPI_SR_BSY);
-        GPIOA->BSRR = GPIO_BSRR_BS_10;
-    }
-
-    uint32_t spi_word = read_fb->data[active_bit*FRAME_SIZE_WORDS + active_segment];
-    SPI1->DR = spi_word>>16;
-    spi_word &= 0xFFFF;
-    while (!(SPI1->SR & SPI_SR_TXE));
-    SPI1->DR = spi_word;
-    while (!(SPI1->SR & SPI_SR_TXE));
-    //tick();
-    //strobe_leds();
-    // FIXME SPI1->CR2 |= SPI_CR2_TXEIE;
-
-    return active_bit;
-}
-
-#define NBITS_MAX 14
+static unsigned int active_bit = 0;
+static int active_segment = 0;
 
 /* Bit timing base value. This is the lowes bit interval used */
 #define PERIOD_BASE 4
 
 /* This value is a constant offset added to every bit period to allow for the timer IRQ handler to execute. This is set
  * empirically using a debugger and a logic analyzer. */
-#define TIMER_CYCLES_FOR_SPI_TRANSMISSIONS 21
+#define TIMER_CYCLES_FOR_SPI_TRANSMISSIONS 13
 
-#define TIMER_CYCLES_BEFORE_LED_STROBE 20
+#define TIMER_CYCLES_BEFORE_LED_STROBE 12
+
+#define AUX_SPI_PRETRIGGER 20
 
 /* Defines for brevity */
 #define A TIMER_CYCLES_FOR_SPI_TRANSMISSIONS
@@ -235,7 +192,7 @@ int shift_data() {
 /* This lookup table maps bit positions to timer period values. This is a lookup table to allow for the compensation for
  * non-linear effects of ringing at lower bit durations.
  */
-static uint16_t timer_period_lookup[NBITS_MAX] = {
+static uint16_t timer_period_lookup[MAX_BITS+1] = {
     /* LSB here */
     A - C + (B<< 0),
     A - C + (B<< 1),
@@ -247,10 +204,7 @@ static uint16_t timer_period_lookup[NBITS_MAX] = {
     A - C + (B<< 7),
     A - C + (B<< 8),
     A - C + (B<< 9),
-    A - C + (B<<10),
-    A - C + (B<<11),
-    A - C + (B<<12),
-    A - C + (B<<13),
+    A - C + (B<< 0),
     /* MSB here */
 };
 
@@ -280,7 +234,9 @@ void cfg_timer3() {
     TIM1->BDTR  = TIM_BDTR_MOE;
     TIM1->SMCR  = (2<<TIM_SMCR_TS_Pos) | (4<<TIM_SMCR_SMS_Pos); /* Internal Trigger 2 (ITR2) -> TIM3; slave mode: reset */
     TIM1->CCMR1 = (6<<TIM_CCMR1_OC2M_Pos) | TIM_CCMR1_OC2PE; /* PWM Mode 1, enable CCR preload */
-    TIM1->CCER  = TIM_CCER_CC2E;
+    TIM1->CCER  = TIM_CCER_CC2E | TIM_CCER_CC1E;
+    TIM1->CCR1  = timer_period_lookup[nbits-1] - AUX_SPI_PRETRIGGER;
+    TIM1->DIER  = TIM_DIER_CC1IE;
     TIM1->CCR2  = TIMER_CYCLES_BEFORE_LED_STROBE;
     TIM1->PSC   = TIM3->PSC; /* 0.20us/tick */
     TIM1->ARR   = 0xffff;
@@ -288,19 +244,59 @@ void cfg_timer3() {
     TIM1->CR1   = TIM_CR1_ARPE;
     TIM1->CR1  |= TIM_CR1_CEN;
 
+    NVIC_EnableIRQ(TIM1_CC_IRQn);
+    NVIC_SetPriority(TIM1_CC_IRQn, 3);
+
     NVIC_EnableIRQ(TIM3_IRQn);
     NVIC_SetPriority(TIM3_IRQn, 2);
+}
+
+void TIM1_CC_IRQHandler() {
+    GPIOA->BSRR = GPIO_BSRR_BS_0; // Debug
+
+    active_bit = 0;
+    active_segment++;
+    if (active_segment == NSEGMENTS) {
+        active_segment = 0;
+
+        /* FIXME remove this?
+        int time = stk_microseconds();
+        frame_duration_us = time - last_frame_time;
+        last_frame_time = time;
+        */
+        if (fb_op == FB_UPDATE) {
+            volatile struct framebuf *tmp = read_fb;
+            read_fb = write_fb;
+            write_fb = tmp;
+            fb_op = FB_WRITE;
+        }
+    }
+
+    GPIOA->BSRR = GPIO_BSRR_BR_10;
+    SPI1->DR = aux_reg | segment_map[active_segment];
+
+    TIM1->SR &= ~TIM_SR_CC1IF_Msk;
+    GPIOA->BSRR = GPIO_BSRR_BR_0; // Debug
 }
 
 void TIM3_IRQHandler() {
     GPIOA->BSRR = GPIO_BSRR_BS_4; // Debug
     //TIM3->CR1 &= ~TIM_CR1_CEN_Msk; FIXME
 
-    int idx = shift_data();
-    TIM3->ARR = timer_period_lookup[idx];
+    GPIOA->BSRR = GPIO_BSRR_BS_10;
+
+    /* Note: On boot, multiplexing will start with bit 1 due to the next few lines. This is perfectly ok. */
+    uint32_t spi_word = read_fb->data[active_bit*FRAME_SIZE_WORDS + active_segment];
+    SPI1->DR = spi_word>>16;
+    spi_word &= 0xFFFF;
+    while (!(SPI1->SR & SPI_SR_TXE));
+    SPI1->DR = spi_word;
+    while (!(SPI1->SR & SPI_SR_TXE));
+
+    active_bit++;
+    TIM3->ARR = timer_period_lookup[active_bit];
 
     TIM3->SR &= ~TIM_SR_UIF_Msk;
-    //TIM3->CR1 |= TIM_CR1_CEN;
     GPIOA->BSRR = GPIO_BSRR_BR_4; // Debug
 }
 
@@ -417,7 +413,7 @@ int main(void) {
         | (2<<GPIO_MODER_MODER1_Pos)  /* PA1  - RS485 DE */
         | (2<<GPIO_MODER_MODER2_Pos)  /* PA2  - RS485 TX */
         | (2<<GPIO_MODER_MODER3_Pos)  /* PA3  - RS485 RX */
-        | (1<<GPIO_MODER_MODER4_Pos)  /* PA3  - Debug */
+        | (1<<GPIO_MODER_MODER4_Pos)  /* PA4  - Debug */
         | (2<<GPIO_MODER_MODER5_Pos)  /* PA5  - SCLK */
         | (2<<GPIO_MODER_MODER6_Pos)  /* PA6  - LED !OE */
         | (2<<GPIO_MODER_MODER7_Pos)  /* PA7  - MOSI */
