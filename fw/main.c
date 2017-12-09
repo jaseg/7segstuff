@@ -176,11 +176,11 @@ static int active_segment = 0;
 
 /* This value is a constant offset added to every bit period to allow for the timer IRQ handler to execute. This is set
  * empirically using a debugger and a logic analyzer. */
-#define TIMER_CYCLES_FOR_SPI_TRANSMISSIONS 13
+#define TIMER_CYCLES_FOR_SPI_TRANSMISSIONS 9
 
-#define TIMER_CYCLES_BEFORE_LED_STROBE 12
+#define TIMER_CYCLES_BEFORE_LED_STROBE 8
 
-#define AUX_SPI_PRETRIGGER 20
+#define AUX_SPI_PRETRIGGER 64
 
 /* Defines for brevity */
 #define A TIMER_CYCLES_FOR_SPI_TRANSMISSIONS
@@ -252,7 +252,10 @@ void cfg_timer3() {
 }
 
 void TIM1_CC_IRQHandler() {
+    /* This handler takes about 1.5us */
     GPIOA->BSRR = GPIO_BSRR_BS_0; // Debug
+
+    SPI1->CR1 |= (2<<SPI_CR1_BR_Pos); /* Set baudrate to 12.5MBd for slow-ish 74HC(T)595*/
 
     active_bit = 0;
     active_segment++;
@@ -280,9 +283,11 @@ void TIM1_CC_IRQHandler() {
 }
 
 void TIM3_IRQHandler() {
+    /* This handler takes about 2.3us */
     GPIOA->BSRR = GPIO_BSRR_BS_4; // Debug
     //TIM3->CR1 &= ~TIM_CR1_CEN_Msk; FIXME
 
+    SPI1->CR1 &= ~SPI_CR1_BR_Msk; /* Reset baudrate to 25MBd for fast MBI5026*/
     GPIOA->BSRR = GPIO_BSRR_BS_10;
 
     /* Note: On boot, multiplexing will start with bit 1 due to the next few lines. This is perfectly ok. */
