@@ -141,14 +141,6 @@ unsigned int stk_microseconds(void) {
     return sys_time*1000 + (1000 - (SysTick->VAL / (SystemCoreClock/1000000)));
 }
 
-enum {
-    SPI_AUX,
-    SPI_WORD0,
-    SPI_WORD1,
-    SPI_IDLE,
-} spi_state;
-static volatile uint32_t spi_word = 0;
-
 void cfg_spi1() {
     /* Configure SPI controller */
     SPI1->I2SCFGR = 0;
@@ -156,46 +148,23 @@ void cfg_spi1() {
     SPI1->CR2 &= ~SPI_CR2_DS_Msk;
     SPI1->CR2 |= LL_SPI_DATAWIDTH_16BIT;
 
-    /* Baud rate PCLK/2 -> 25MHz */
+    /* Baud rate PCLK/4 -> 12.5MHz */
     SPI1->CR1 =
           SPI_CR1_BIDIMODE
         | SPI_CR1_BIDIOE
         | SPI_CR1_SSM
         | SPI_CR1_SSI
         | SPI_CR1_SPE
-        | (0<<SPI_CR1_BR_Pos)
+        | (1<<SPI_CR1_BR_Pos)
         | SPI_CR1_MSTR
         | SPI_CR1_CPOL
         | SPI_CR1_CPHA;
     /* FIXME maybe try w/o BIDI */
-
-    NVIC_EnableIRQ(SPI1_IRQn);
-    NVIC_SetPriority(SPI1_IRQn, 2);
-}
-
-void SPI1_IRQHandler() {
-    GPIOA->BSRR = GPIO_BSRR_BS_0; // Debug
-    switch (spi_state) {
-        case SPI_AUX:
-            strobe_aux();
-            SPI1->DR = spi_word>>16;
-            break;
-        case SPI_WORD0:
-            SPI1->DR = spi_word&0xFFFF;
-            break;
-        default:
-            tick(); /* This one is important. Otherwise, weird stuff happens and parts of the aux register seem to leak
-                       into the driver registers. */
-            strobe_leds();
-            SPI1->CR2 &= ~SPI_CR2_TXEIE;
-            break;
-    }
-    spi_state ++;
-    GPIOA->BSRR = GPIO_BSRR_BR_0; // Debug
 }
 
 uint8_t segment_map[8] = {5, 7, 6, 4, 1, 3, 0, 2};
 
+static volatile uint32_t aux_reg = 0;
 static volatile int frame_duration_us;
 volatile int nbits = MAX_BITS;
 /* returns new bit time in cycles */
@@ -213,9 +182,11 @@ int shift_data() {
         if (active_segment == NSEGMENTS) {
             active_segment = 0;
 
+            /* FIXME remove this?
             int time = stk_microseconds();
             frame_duration_us = time - last_frame_time;
             last_frame_time = time;
+            */
             if (fb_op == FB_UPDATE) {
                 volatile struct framebuf *tmp = read_fb;
                 read_fb = write_fb;
@@ -224,17 +195,21 @@ int shift_data() {
             }
         }
 
-        spi_word = read_fb->data[active_bit*FRAME_SIZE_WORDS + active_segment];
-        spi_state = SPI_AUX;
-        SPI1->DR = (read_fb->brightness ? SR_ILED_HIGH : SR_ILED_LOW)
-            | (led_state<<1)
-            | (0xff00 ^ (0x100<<segment_map[active_segment]));
-    } else {
-        spi_word = read_fb->data[active_bit*FRAME_SIZE_WORDS + active_segment];
-        spi_state = SPI_WORD0;
-        SPI1->DR = spi_word>>16;
+        GPIOA->BSRR = GPIO_BSRR_BR_10;
+        SPI1->DR = aux_reg | segment_map[active_segment];
+        while (SPI1->SR & SPI_SR_BSY);
+        GPIOA->BSRR = GPIO_BSRR_BS_10;
     }
-    SPI1->CR2 |= SPI_CR2_TXEIE;
+
+    uint32_t spi_word = read_fb->data[active_bit*FRAME_SIZE_WORDS + active_segment];
+    SPI1->DR = spi_word>>16;
+    spi_word &= 0xFFFF;
+    while (!(SPI1->SR & SPI_SR_TXE));
+    SPI1->DR = spi_word;
+    while (!(SPI1->SR & SPI_SR_TXE));
+    //tick();
+    //strobe_leds();
+    // FIXME SPI1->CR2 |= SPI_CR2_TXEIE;
 
     return active_bit;
 }
@@ -246,7 +221,9 @@ int shift_data() {
 
 /* This value is a constant offset added to every bit period to allow for the timer IRQ handler to execute. This is set
  * empirically using a debugger and a logic analyzer. */
-#define TIMER_CYCLES_FOR_SPI_TRANSMISSIONS 25
+#define TIMER_CYCLES_FOR_SPI_TRANSMISSIONS 21
+
+#define TIMER_CYCLES_BEFORE_LED_STROBE 20
 
 /* Defines for brevity */
 #define A TIMER_CYCLES_FOR_SPI_TRANSMISSIONS
@@ -288,14 +265,29 @@ void cfg_timer3() {
      * interrupt to load the next bits in to the shift registers. Channel 2 triggers simultaneously with channel 1 at
      * long !OE periods but will be delayed slightly to a fixed 32 timer periods (12.8us) to allow for SPI1 to finish
      * shifting out all frame data before asserting !OE. */
+    TIM3->CR2   = (2<<TIM_CR2_MMS_Pos); /* master mode: update */
     TIM3->CCMR1 = (6<<TIM_CCMR1_OC1M_Pos) | TIM_CCMR1_OC1PE; /* PWM Mode 1, enable CCR preload */
-    TIM3->CCER  = TIM_CCER_CC1E; /* Inverting output */
+    TIM3->CCER  = TIM_CCER_CC1E;
+    TIM3->CCR1  = TIMER_CYCLES_FOR_SPI_TRANSMISSIONS;
     TIM3->DIER  = TIM_DIER_UIE;
     TIM3->PSC   = SystemCoreClock/5000000 * 2 - 1; /* 0.20us/tick */
     TIM3->ARR   = 0xffff;
     TIM3->EGR  |= TIM_EGR_UG;
     TIM3->CR1   = TIM_CR1_ARPE;
     TIM3->CR1  |= TIM_CR1_CEN;
+
+    TIM1->SR    = 0;
+    TIM1->BDTR  = TIM_BDTR_MOE;
+    TIM1->SMCR  = (2<<TIM_SMCR_TS_Pos) | (4<<TIM_SMCR_SMS_Pos); /* Internal Trigger 2 (ITR2) -> TIM3; slave mode: reset */
+    TIM1->CCMR1 = (6<<TIM_CCMR1_OC2M_Pos) | TIM_CCMR1_OC2PE; /* PWM Mode 1, enable CCR preload */
+    TIM1->CCER  = TIM_CCER_CC2E;
+    TIM1->CCR2  = TIMER_CYCLES_BEFORE_LED_STROBE;
+    TIM1->PSC   = TIM3->PSC; /* 0.20us/tick */
+    TIM1->ARR   = 0xffff;
+    TIM1->EGR  |= TIM_EGR_UG;
+    TIM1->CR1   = TIM_CR1_ARPE;
+    TIM1->CR1  |= TIM_CR1_CEN;
+
     NVIC_EnableIRQ(TIM3_IRQn);
     NVIC_SetPriority(TIM3_IRQn, 2);
 }
@@ -305,7 +297,6 @@ void TIM3_IRQHandler() {
     //TIM3->CR1 &= ~TIM_CR1_CEN_Msk; FIXME
 
     int idx = shift_data();
-    TIM3->CCR1 = TIMER_CYCLES_FOR_SPI_TRANSMISSIONS;
     TIM3->ARR = timer_period_lookup[idx];
 
     TIM3->SR &= ~TIM_SR_UIF_Msk;
@@ -418,7 +409,7 @@ int main(void) {
     SystemCoreClockUpdate();
 
     RCC->AHBENR  |= RCC_AHBENR_GPIOAEN | RCC_AHBENR_DMAEN | RCC_AHBENR_CRCEN | RCC_AHBENR_FLITFEN;
-    RCC->APB2ENR |= RCC_APB2ENR_SPI1EN | RCC_APB2ENR_USART1EN | RCC_APB2ENR_SYSCFGEN | RCC_APB2ENR_ADCEN | RCC_APB2ENR_DBGMCUEN;
+    RCC->APB2ENR |= RCC_APB2ENR_SPI1EN | RCC_APB2ENR_USART1EN | RCC_APB2ENR_SYSCFGEN | RCC_APB2ENR_ADCEN | RCC_APB2ENR_DBGMCUEN | RCC_APB2ENR_TIM1EN;
     RCC->APB1ENR |= RCC_APB1ENR_TIM3EN;
 
     GPIOA->MODER |=
@@ -430,7 +421,7 @@ int main(void) {
         | (2<<GPIO_MODER_MODER5_Pos)  /* PA5  - SCLK */
         | (2<<GPIO_MODER_MODER6_Pos)  /* PA6  - LED !OE */
         | (2<<GPIO_MODER_MODER7_Pos)  /* PA7  - MOSI */
-        | (1<<GPIO_MODER_MODER9_Pos)  /* PA9  - LED strobe */
+        | (2<<GPIO_MODER_MODER9_Pos)  /* PA9  - LED strobe */
         | (1<<GPIO_MODER_MODER10_Pos);/* PA10 - Auxiliary strobe */
 
     /* Set shift register IO GPIO output speed */
@@ -453,6 +444,8 @@ int main(void) {
         | (0<<GPIO_AFRL_AFRL5_Pos)   /* SPI1_SCK */
         | (1<<GPIO_AFRL_AFRL6_Pos)   /* TIM3_CH1 */
         | (0<<GPIO_AFRL_AFRL7_Pos);  /* SPI1_MOSI */
+    GPIOA->AFR[1] |=
+          (2<<GPIO_AFRH_AFRH1_Pos);  /* TIM1_CH2 */
 
     GPIOA->PUPDR |=
           (2<<GPIO_PUPDR_PUPDR1_Pos)  /* RS485 DE: Pulldown */
@@ -460,6 +453,11 @@ int main(void) {
         | (1<<GPIO_PUPDR_PUPDR3_Pos); /* RX */
 
     cfg_spi1();
+
+    /* Pre-compute aux register values for timer ISR */
+    for (int i=0; i<sizeof(segment_map)/sizeof(segment_map[0]); i++) {
+        segment_map[i] = 0xff00 ^ (0x100<<segment_map[i]);
+    }
 
     /* Clear frame buffer */
     read_fb->brightness = 1;
@@ -473,7 +471,14 @@ int main(void) {
     adc_config();
 
     volatile uint8_t *rxd = rx_buf.byte_data;
+    int k=0;
     while (42) {
+        aux_reg = (read_fb->brightness ? SR_ILED_HIGH : SR_ILED_LOW) | (led_state<<1);
+        if (k++ == 1000000) {
+            k = 0;
+            led_state = (led_state+1)&7;
+        }
+
         if (USART1->ISR & USART_ISR_RXNE) {
             *rxd++ = USART1->RDR;
             if (rxd >= rx_buf.set_fb_rq.end) {
@@ -508,6 +513,6 @@ void SysTick_Handler(void) {
     if (n++ == 1000) {
         n = 0;
         sys_time_seconds++;
-}
+    }
 }
 
