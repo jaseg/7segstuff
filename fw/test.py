@@ -5,11 +5,15 @@ def chunked(data, chunk_size):
     for i in range(0, len(data), chunk_size):
         yield data[i:i+chunk_size]
 
-def frame_packet(data, chunk_size=32, frame_char=b'\x42'):
-    return frame_char + frame_char.join(chunked(data, chunk_size))
-
-def sync_frame(sync_char=b'\x23', chunk_size=32):
-    return sync_char*(chunk_size+1)
+def frame_packet(data):
+    if len(data) > 254:
+        raise ValueError('Input too long')
+    out = b''
+    for run in data.split(b'\0'):
+        out += bytes([len(run)+1])
+        out += run
+    out += b'\0'
+    return out
 
 def format_packet(data):
     out = b''
@@ -18,6 +22,7 @@ def format_packet(data):
         al, bl, cl, dl = a&0xff, b&0xff, c&0xff, d&0xff
         # FIXME check order of high bits
         out += bytes([al, bl, cl, dl, (ah<<6 | bh<<4 | ch<<2 | dh<<0)&0xff])
+    out += bytes([1, 0, 0, 0]) # global intensity
     return out
 
 if __name__ == '__main__':
@@ -35,17 +40,14 @@ if __name__ == '__main__':
     frames = \
             [black]*10 +\
             [red]*10 +\
-            [[i]*frame_len for i in range(0, 256, 4)] +\
-            [[(i + (d//8)*8) % 256*8 for d in range(frame_len)] for i in range(0, 256, 16)]
+            [[i]*frame_len for i in range(256)] +\
+            [[(i + (d//8)*8) % 256*8 for d in range(frame_len)] for i in range(256)]
 
-    frames = [red, black]*5
+    #frames = [red, black]*5
     while True:
-        print('Sending sync structure')
-        ser.write(sync_frame())
         for i, frame in enumerate(frames):
             formatted = format_packet(frame)
-            #formatted = format_packet(list(range(256)))
-            framed = frame_packet(formatted)
+            framed = b'\0' + frame_packet(formatted[:162]) + frame_packet(formatted[162:])
             print('sending', i, len(frame), len(formatted), len(framed))
             ser.write(framed)
-            time.sleep(0.1)
+            time.sleep(0.02)

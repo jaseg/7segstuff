@@ -348,14 +348,46 @@ void uart_config(void) {
     NVIC_SetPriority(USART1_IRQn, 3);
 }
 
+/* Error counters */
 static unsigned int overruns = 0;
 static unsigned int frame_overruns = 0;
+static unsigned int invalid = 0;
+
+volatile uint8_t *packet_received(int len) {
+    static int packet_state = 0; 
+    if (len == 0) {
+        packet_state = 0;
+    } else if (len == sizeof(rx_buf.set_fb_rq)/2) {
+        if (packet_state == 0) {
+            packet_state = 1;
+            return rx_buf.byte_data + (sizeof(rx_buf.set_fb_rq)/2);
+        } else if (packet_state == 1) {
+            if (fb_op == FB_WRITE) {
+                fb_op = FB_FORMAT;
+            } else {
+                /* FIXME An overrun happend. What should we do? */
+                frame_overruns++;
+            }
+            packet_state = 2;
+        }
+    } else {
+        /* FIXME An invalid packet has been received. What should we do? */
+        invalid++;
+        packet_state = 2;
+    }
+    return rx_buf.byte_data;
+}
+
 #define SYNC_LENGTH 32 /* Must be a power of two */
 void USART1_IRQHandler(void) {
-    static uint8_t expect_framing = 1;
+    static volatile uint8_t *writep = rx_buf.byte_data;
     static int rxpos = 0;
-    static int resync = SYNC_LENGTH+1;
-    static int sync_chars = 0;
+    static enum {
+        COBS_WAIT_SYNC = 0,
+        COBS_WAIT_START = 1,
+        COBS_RUNNING = 2
+    } cobs_state = 0;
+    static int cobs_count = 0;
 
     GPIOA->BSRR = GPIO_BSRR_BS_0; // Debug
 
@@ -363,42 +395,28 @@ void USART1_IRQHandler(void) {
         /* FIXME An overrun happend. What should we do? */
         overruns++;
         rxpos = 0;
-        expect_framing = 1;
+        cobs_state = COBS_WAIT_SYNC;
         USART1->ICR = USART_ICR_ORECF;
     } else { /* RXNE */
         uint8_t data = USART1->RDR;
 
-        if (data == 0x23)
-            sync_chars++;
-        else
-            sync_chars = 0;
-
-        if (resync) {
-            if (sync_chars == SYNC_LENGTH+1) {
-                resync = 0;
-            }
-        } else if (expect_framing) {
-            if (data == 0x42) {
-                expect_framing = 0;
-            } else {
-                rxpos = 0;
-                resync = 1;
-            }
+        if (data == 0x00) { /* End-of-packet */
+            writep = packet_received(rxpos);
+            cobs_state = COBS_WAIT_START;
+            rxpos = 0;
         } else {
-            rx_buf.byte_data[rxpos] = data;
-            rxpos++;
-            if ((rxpos&(SYNC_LENGTH-1)) == 0) {
-                expect_framing = 1;
-            }
-            if (rxpos >= sizeof(rx_buf.set_fb_rq)) {
-                rxpos = 0;
-                expect_framing = 1;
-                if (fb_op == FB_WRITE) {
-                    fb_op = FB_FORMAT;
-                } else {
-                    /* FIXME An overrun happend. What should we do? */
-                    frame_overruns++;
+            if (cobs_state == COBS_WAIT_SYNC) {
+                /* ignore data */
+            } else if (cobs_state == COBS_WAIT_START) {
+                cobs_count = data;
+                cobs_state = COBS_RUNNING;
+            } else {
+                if (--cobs_count == 0) {
+                    cobs_count = data;
+                    data = 0;
                 }
+
+                writep[rxpos++] = data;
             }
         }
     }
@@ -538,10 +556,6 @@ int main(void) {
             led_state = (led_state+1)&7;
         }
         if (fb_op == FB_FORMAT) {
-            for (int i=0; i<sizeof(rx_buf.set_fb_rq); i++) {
-                if (rx_buf.byte_data[i] == 0x42)
-                    asm("bkpt");
-            }
             transpose_data(rx_buf.byte_data, write_fb);
             fb_op = FB_UPDATE;
         }
