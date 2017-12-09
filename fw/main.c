@@ -245,7 +245,7 @@ void cfg_timer3() {
     TIM1->CR1  |= TIM_CR1_CEN;
 
     NVIC_EnableIRQ(TIM1_CC_IRQn);
-    NVIC_SetPriority(TIM1_CC_IRQn, 3);
+    NVIC_SetPriority(TIM1_CC_IRQn, 2);
 
     NVIC_EnableIRQ(TIM3_IRQn);
     NVIC_SetPriority(TIM3_IRQn, 2);
@@ -253,7 +253,7 @@ void cfg_timer3() {
 
 void TIM1_CC_IRQHandler() {
     /* This handler takes about 1.5us */
-    GPIOA->BSRR = GPIO_BSRR_BS_0; // Debug
+    GPIOA->BSRR = GPIO_BSRR_BS_4; // Debug
 
     SPI1->CR1 |= (2<<SPI_CR1_BR_Pos); /* Set baudrate to 12.5MBd for slow-ish 74HC(T)595*/
 
@@ -279,11 +279,11 @@ void TIM1_CC_IRQHandler() {
     SPI1->DR = aux_reg | segment_map[active_segment];
 
     TIM1->SR &= ~TIM_SR_CC1IF_Msk;
-    GPIOA->BSRR = GPIO_BSRR_BR_0; // Debug
+    GPIOA->BSRR = GPIO_BSRR_BR_4; // Debug
 }
 
 void TIM3_IRQHandler() {
-    /* This handler takes about 2.3us */
+    /* This handler takes about 2.1us */
     GPIOA->BSRR = GPIO_BSRR_BS_4; // Debug
     //TIM3->CR1 &= ~TIM_CR1_CEN_Msk; FIXME
 
@@ -296,7 +296,6 @@ void TIM3_IRQHandler() {
     spi_word &= 0xFFFF;
     while (!(SPI1->SR & SPI_SR_TXE));
     SPI1->DR = spi_word;
-    while (!(SPI1->SR & SPI_SR_TXE));
 
     active_bit++;
     TIM3->ARR = timer_period_lookup[active_bit];
@@ -340,11 +339,57 @@ void uart_config(void) {
         | USART_CR1_TE
         | USART_CR1_RE;
     //USART1->CR2 = USART_CR2_RTOEN; /* Timeout enable */
-    USART1->CR3 = USART_CR3_DEM /* RS485 DE enable (output on RTS) */
-            | USART_CR3_DMAT;
+    USART1->CR3 = USART_CR3_DEM; /* RS485 DE enable (output on RTS) */
     int usartdiv = 25;
     USART1->BRR = usartdiv;
     USART1->CR1 |= USART_CR1_UE;
+
+    NVIC_EnableIRQ(USART1_IRQn);
+    NVIC_SetPriority(USART1_IRQn, 3);
+}
+
+static unsigned int overruns = 0;
+static unsigned int frame_overruns = 0;
+void USART1_IRQHandler(void) {
+    static uint8_t expect_framing = 1;
+    static int rxpos = 0;
+
+    GPIOA->BSRR = GPIO_BSRR_BS_0; // Debug
+
+    if (USART1->ISR & USART_ISR_ORE) {
+        /* FIXME An overrun happend. What should we do? */
+        overruns++;
+        rxpos = 0;
+        expect_framing = 1;
+        USART1->ICR = USART_ICR_ORECF;
+    } else { /* RXNE */
+        uint8_t data = USART1->RDR;
+        if (expect_framing) {
+            if (data == 0x42) {
+                expect_framing = 0;
+            } else {
+                rxpos = 0;
+            }
+        } else {
+            rx_buf.byte_data[rxpos] = data;
+            rxpos++;
+            if ((rxpos&0x1F) == 0) {
+                expect_framing = 1;
+            }
+            if (rxpos >= sizeof(rx_buf.set_fb_rq)) {
+                rxpos = 0;
+                expect_framing = 1;
+                if (fb_op == FB_WRITE) {
+                    fb_op = FB_FORMAT;
+                } else {
+                    /* FIXME An overrun happend. What should we do? */
+                    frame_overruns++;
+                }
+            }
+        }
+    }
+
+    GPIOA->BSRR = GPIO_BSRR_BR_0; // Debug
 }
 
 #define ADC_OVERSAMPLING 12
@@ -469,9 +514,8 @@ int main(void) {
     cfg_timer3();
     SysTick_Config(SystemCoreClock/1000); /* 1ms interval */
     uart_config();
-    adc_config();
+    //adc_config();
 
-    volatile uint8_t *rxd = rx_buf.byte_data;
     int k=0;
     while (42) {
         aux_reg = (read_fb->brightness ? SR_ILED_HIGH : SR_ILED_LOW) | (led_state<<1);
@@ -479,16 +523,9 @@ int main(void) {
             k = 0;
             led_state = (led_state+1)&7;
         }
-
-        if (USART1->ISR & USART_ISR_RXNE) {
-            *rxd++ = USART1->RDR;
-            if (rxd >= rx_buf.set_fb_rq.end) {
-                rxd = rx_buf.byte_data;
-                if (fb_op == FB_FORMAT) {
-                    transpose_data(rx_buf.byte_data, write_fb);
-                    fb_op = FB_UPDATE;
-                }
-            }
+        if (fb_op == FB_FORMAT) {
+            transpose_data(rx_buf.byte_data, write_fb);
+            fb_op = FB_UPDATE;
         }
     }
 }
