@@ -162,7 +162,7 @@ void cfg_spi1() {
     /* FIXME maybe try w/o BIDI */
 }
 
-uint8_t segment_map[8] = {5, 7, 6, 4, 1, 3, 0, 2};
+uint32_t segment_map[8] = {5, 7, 6, 4, 1, 3, 0, 2};
 
 static volatile uint32_t aux_reg = 0;
 static volatile int frame_duration_us;
@@ -213,12 +213,34 @@ static uint16_t timer_period_lookup[MAX_BITS+1] = {
 #undef B
 #undef C
 
-void cfg_timer3() {
-    /* FIXME update comment */
-    /* Capture/compare channel 1 is used to generate the LED driver !OE signal. Channel 2 is used to trigger the
-     * interrupt to load the next bits in to the shift registers. Channel 2 triggers simultaneously with channel 1 at
-     * long !OE periods but will be delayed slightly to a fixed 32 timer periods (12.8us) to allow for SPI1 to finish
-     * shifting out all frame data before asserting !OE. */
+void cfg_timers_led() {
+    /* Ok, so this part is unfortunately a bit involved.
+     *
+     * Because the GPIO alternate function assignments worked out that way, the LED driving logic uses timers 1 and 3.
+     * Timer 1 is synchronized to timer 3. When timer 3 overflows, timer 1 is reset. Both use the same prescaler so both
+     * are synchronous possibly modulo some propagation delay in the synchronization hardware.
+     *
+     * Timer 3:
+     *  * The IRQ handler is set to trigger on overflow and
+     *    * triggers the SPI transmissions to the LED drivers and
+     *    * updates the timing logic with the delays for the next cycle
+     *  * Compare unit 1 generates the !OE signal for the led drivers
+     * Timer 1:
+     *  * Compare unit 1 triggers the interrupt handler only in the longest bit cycle. The IRQ handler
+     *    * transmits the data to the auxiliary shift registers and
+     *    * swaps the frame buffers if pending
+     *  * Compare unit 2 generates the led drivers' STROBE signal
+     * 
+     * The AUX_STROBE signal for the two auxiliary shift registers that deal with segment selection, current setting and
+     * status leds is generated in software in both ISRs. TIM3's ISR indiscriminately resets this strobe every bit
+     * cycle, and TIM1's ISR sets it every NBITSth bit cycle.
+     *
+     * The reason both timers' IRQ handlers are used is that this way no big if/else statement is necessary to
+     * distinguish between both cases. Timer 1's IRQ handler is set via CC2 to trigger a few cycles earlier than the end
+     * of the longest bit cycle. This means that if both timers perform bit cycles of length 1, 2, 4, 8, 16 and 32
+     * TIM1_CC2 will be set to trigger at count e.g. 28. This means it is only triggered once in the last timer cycle.
+     */
+
     TIM3->CR2   = (2<<TIM_CR2_MMS_Pos); /* master mode: update */
     TIM3->CCMR1 = (6<<TIM_CCMR1_OC1M_Pos) | TIM_CCMR1_OC1PE; /* PWM Mode 1, enable CCR preload */
     TIM3->CCER  = TIM_CCER_CC1E;
@@ -230,23 +252,30 @@ void cfg_timer3() {
     TIM3->CR1   = TIM_CR1_ARPE;
     TIM3->CR1  |= TIM_CR1_CEN;
 
-    TIM1->SR    = 0;
-    TIM1->BDTR  = TIM_BDTR_MOE;
+    /* Slave TIM1 to TIM3. */
+    TIM1->PSC   = TIM3->PSC;
     TIM1->SMCR  = (2<<TIM_SMCR_TS_Pos) | (4<<TIM_SMCR_SMS_Pos); /* Internal Trigger 2 (ITR2) -> TIM3; slave mode: reset */
-    TIM1->CCMR1 = (6<<TIM_CCMR1_OC2M_Pos) | TIM_CCMR1_OC2PE; /* PWM Mode 1, enable CCR preload */
+
+    /* Setup CC1 and CC2. CC2 generates the LED drivers' STROBE, CC1 triggers the IRQ handler. */
+    TIM1->BDTR  = TIM_BDTR_MOE;
+    TIM1->CCMR1 = (6<<TIM_CCMR1_OC2M_Pos) | TIM_CCMR1_OC2PE; /* PWM Mode 1, enable CCR preload for AUX_STROBE */
     TIM1->CCER  = TIM_CCER_CC2E | TIM_CCER_CC1E;
+    TIM1->CCR2  = TIMER_CYCLES_BEFORE_LED_STROBE;
+    /* Trigger at the end of the longest bit cycle. This means this does not trigger in shorter bit cycles. */
     TIM1->CCR1  = timer_period_lookup[nbits-1] - AUX_SPI_PRETRIGGER;
     TIM1->DIER  = TIM_DIER_CC1IE;
-    TIM1->CCR2  = TIMER_CYCLES_BEFORE_LED_STROBE;
-    TIM1->PSC   = TIM3->PSC; /* 0.20us/tick */
-    TIM1->ARR   = 0xffff;
+
+    TIM1->ARR   = 0xffff; /* This is as large as possible since TIM1 is reset by TIM3. */
+    /* Preload all values */
     TIM1->EGR  |= TIM_EGR_UG;
     TIM1->CR1   = TIM_CR1_ARPE;
+    /* And... go! */
     TIM1->CR1  |= TIM_CR1_CEN;
 
+    /* Sends aux data and swaps frame buffers if necessary */
     NVIC_EnableIRQ(TIM1_CC_IRQn);
     NVIC_SetPriority(TIM1_CC_IRQn, 2);
-
+    /* Sends LED data and sets up the next bit cycle's timings */
     NVIC_EnableIRQ(TIM3_IRQn);
     NVIC_SetPriority(TIM3_IRQn, 2);
 }
@@ -255,8 +284,10 @@ void TIM1_CC_IRQHandler() {
     /* This handler takes about 1.5us */
     GPIOA->BSRR = GPIO_BSRR_BS_4; // Debug
 
-    SPI1->CR1 |= (2<<SPI_CR1_BR_Pos); /* Set baudrate to 12.5MBd for slow-ish 74HC(T)595*/
+    /* Set SPI baudrate to 12.5MBd for slow-ish 74HC(T)595. This is reset again in TIM3's IRQ handler.*/
+    SPI1->CR1 |= (2<<SPI_CR1_BR_Pos);
 
+    /* Advance bit counts and perform pending frame buffer swap */
     active_bit = 0;
     active_segment++;
     if (active_segment == NSEGMENTS) {
@@ -267,6 +298,7 @@ void TIM1_CC_IRQHandler() {
         frame_duration_us = time - last_frame_time;
         last_frame_time = time;
         */
+        /* Frame buffer swap */
         if (fb_op == FB_UPDATE) {
             volatile struct framebuf *tmp = read_fb;
             read_fb = write_fb;
@@ -275,9 +307,12 @@ void TIM1_CC_IRQHandler() {
         }
     }
 
+    /* Reset aux strobe */
     GPIOA->BSRR = GPIO_BSRR_BR_10;
+    /* Send AUX register data */
     SPI1->DR = aux_reg | segment_map[active_segment];
 
+    /* Clear interrupt flag */
     TIM1->SR &= ~TIM_SR_CC1IF_Msk;
     GPIOA->BSRR = GPIO_BSRR_BR_4; // Debug
 }
@@ -285,21 +320,28 @@ void TIM1_CC_IRQHandler() {
 void TIM3_IRQHandler() {
     /* This handler takes about 2.1us */
     GPIOA->BSRR = GPIO_BSRR_BS_4; // Debug
-    //TIM3->CR1 &= ~TIM_CR1_CEN_Msk; FIXME
 
-    SPI1->CR1 &= ~SPI_CR1_BR_Msk; /* Reset baudrate to 25MBd for fast MBI5026*/
+    /* Reset SPI baudrate to 25MBd for fast MBI5026. Every couple of cycles, TIM1's ISR will set this to a slower value
+     * for the slower AUX registers.*/
+    SPI1->CR1 &= ~SPI_CR1_BR_Msk;
+    /* Assert aux strobe reset by TIM1's IRQ handler */
     GPIOA->BSRR = GPIO_BSRR_BS_10;
 
-    /* Note: On boot, multiplexing will start with bit 1 due to the next few lines. This is perfectly ok. */
+    /* Queue LED driver data into SPI peripheral */
     uint32_t spi_word = read_fb->data[active_bit*FRAME_SIZE_WORDS + active_segment];
     SPI1->DR = spi_word>>16;
     spi_word &= 0xFFFF;
+    /* Note that this only waits until the internal FIFO is ready, not until all data has been sent. */
     while (!(SPI1->SR & SPI_SR_TXE));
     SPI1->DR = spi_word;
 
+    /* Advance bit. This will overflow, but that is OK since before the next invocation of this ISR, the other ISR will
+     * reset it. */
     active_bit++;
+    /* Schedule next bit cycle */
     TIM3->ARR = timer_period_lookup[active_bit];
 
+    /* Clear interrupt flag */
     TIM3->SR &= ~TIM_SR_UIF_Msk;
     GPIOA->BSRR = GPIO_BSRR_BR_4; // Debug
 }
@@ -329,93 +371,159 @@ void uart_config(void) {
         /* RTOIE clear */
           (8 << USART_CR1_DEAT_Pos) /* 8 sample cycles/1 bit DE assertion time */
         | (8 << USART_CR1_DEDT_Pos) /* 8 sample cycles/1 bit DE assertion time */
-        //| USART_CR1_OVER8 FIXME debug?
+        /* OVER8 clear. Use default 16x oversampling */
         /* CMIF clear */
         | USART_CR1_MME
         /* WAKE clear */
         /* PCE, PS clear */
-        | USART_CR1_RXNEIE
+        | USART_CR1_RXNEIE /* Enable receive interrupt */
         /* other interrupts clear */
         | USART_CR1_TE
         | USART_CR1_RE;
     //USART1->CR2 = USART_CR2_RTOEN; /* Timeout enable */
     USART1->CR3 = USART_CR3_DEM; /* RS485 DE enable (output on RTS) */
+    /* Set divider for 25MHz baud rate @50MHz system clock. */
     int usartdiv = 25;
     USART1->BRR = usartdiv;
+
+    /* And... go! */
     USART1->CR1 |= USART_CR1_UE;
 
+    /* Enable receive interrupt */
     NVIC_EnableIRQ(USART1_IRQn);
     NVIC_SetPriority(USART1_IRQn, 3);
 }
 
-/* Error counters */
+/* Error counters for debugging */
 static unsigned int overruns = 0;
 static unsigned int frame_overruns = 0;
 static unsigned int invalid = 0;
 
+/* This is the higher-level protocol handler for the serial protocol. It gets passed the number of data bytes in this
+ * frame (which may be zero) and returns a pointer to the buffer where the next frame should be stored.
+ */
 volatile uint8_t *packet_received(int len) {
-    static int packet_state = 0; 
+    static int protocol_state = 0; 
+    /* Use zero-length frames as delimiters to synchronize this protocol layer */
     if (len == 0) {
-        packet_state = 0;
+        protocol_state = 0;
+
     } else if (len == sizeof(rx_buf.set_fb_rq)/2) {
-        if (packet_state == 0) {
-            packet_state = 1;
+        if (protocol_state == 0) { /* First of two half-framebuffer data frames */
+            protocol_state = 1;
+            /* Return second half of receive buffer */
             return rx_buf.byte_data + (sizeof(rx_buf.set_fb_rq)/2);
-        } else if (packet_state == 1) {
+
+        } else if (protocol_state == 1) { /* Second of two half-framebuffer data frames */
+            /* Kick off buffer transfer. This triggers the main loop to copy data out of the receive buffer and paste it
+             * properly formatted into the frame buffer. */
             if (fb_op == FB_WRITE) {
                 fb_op = FB_FORMAT;
             } else {
                 /* FIXME An overrun happend. What should we do? */
                 frame_overruns++;
             }
-            packet_state = 2;
+
+            /* Go to "hang mode" until next zero-length packet. */
+            protocol_state = 2;
         }
+
     } else {
         /* FIXME An invalid packet has been received. What should we do? */
         invalid++;
-        packet_state = 2;
+        protocol_state = 2; /* go into "hang mode" until next zero-length packet */
     }
+
+    /* By default, return rx_buf.byte_data . This means if an invalid protocol state is reached ("hang mode"), the next
+     * frame is still written to rx_buf. This is not a problem since whatever garbage is written at that point will be
+     * overwritten before the next buffer transfer. */
     return rx_buf.byte_data;
 }
 
-#define SYNC_LENGTH 32 /* Must be a power of two */
 void USART1_IRQHandler(void) {
+    /* Since a large amount of data will be shoved down this UART interface we need a more reliable and more efficient
+     * way of framing than just waiting between transmissions.
+     *
+     * This code uses "Consistent Overhead Byte Stuffing" (COBS). For details, see its Wikipedia page[0] or the proper
+     * scientific paper[1] published on it. Roughly, it works like this:
+     *
+     * * A frame is at most 254 bytes in length.
+     * * The null byte 0x00 acts as a frame delimiter. There is no null bytes inside frames.
+     * * Every frame starts with an "overhead" byte indicating the number of non-null payload bytes until the next null
+     *   byte in the payload, **plus one**. This means this byte can never be zero.
+     * * Every null byte in the payload is replaced by *its* distance to *its* next null byte as above.
+     *
+     * This means, at any point the receiver can efficiently be synchronized on the next frame boundary by simply
+     * waiting for a null byte. After that, only a simple state machine is necessary to strip the overhead byte and a
+     * counter to then count skip intervals.
+     *
+     * Here is Wikipedia's table of example values:
+     *
+     *    Unencoded data          Encoded with COBS
+     *    00                      01 01 00
+     *    00 00                   01 01 01 00
+     *    11 22 00 33             03 11 22 02 33 00
+     *    11 22 33 44             05 11 22 33 44 00
+     *    11 00 00 00             02 11 01 01 01 00
+     *    01 02 ...FE             FF 01 02 ...FE 00
+     *
+     * [0] https://en.wikipedia.org/wiki/Consistent_Overhead_Byte_Stuffing
+     * [1] Cheshire, Stuart; Baker, Mary (1999). "Consistent Overhead Byte Stuffing"
+     *     IEEE/ACM Transactions on Networking. doi:10.1109/90.769765
+     *     http://www.stuartcheshire.org/papers/COBSforToN.pdf
+     */
+
+    /* This pointer stores where we write data. The higher-level protocol logic decides on a frame-by-frame-basis where
+     * the next frame's data will be stored. */
     static volatile uint8_t *writep = rx_buf.byte_data;
+    /* Index inside the current frame payload */
     static int rxpos = 0;
+    /* COBS state machine. This implementation might be a little too complicated, but it works well enough and I find it
+     * reasonably easy to understand. */
     static enum {
-        COBS_WAIT_SYNC = 0,
-        COBS_WAIT_START = 1,
-        COBS_RUNNING = 2
+        COBS_WAIT_SYNC = 0,  /* Synchronize with frame */
+        COBS_WAIT_START = 1, /* Await overhead byte */
+        COBS_RUNNING = 2     /* Process payload */
     } cobs_state = 0;
+    /* COBS skip counter. During payload processing this contains the remaining non-null payload bytes */
     static int cobs_count = 0;
 
     GPIOA->BSRR = GPIO_BSRR_BS_0; // Debug
 
-    if (USART1->ISR & USART_ISR_ORE) {
-        /* FIXME An overrun happend. What should we do? */
+    if (USART1->ISR & USART_ISR_ORE) { /* Overrun handling */
         overruns++;
+        /* Reset and re-synchronize. Retry next frame. */
         rxpos = 0;
         cobs_state = COBS_WAIT_SYNC;
+        /* Clear interrupt flag */
         USART1->ICR = USART_ICR_ORECF;
-    } else { /* RXNE */
-        uint8_t data = USART1->RDR;
+
+    } else { /* Data received */
+        uint8_t data = USART1->RDR; /* This automatically acknowledges the IRQ */
 
         if (data == 0x00) { /* End-of-packet */
+            /* Process higher protocol layers on this packet. */
             writep = packet_received(rxpos);
+
+            /* Reset for next packet. */
             cobs_state = COBS_WAIT_START;
             rxpos = 0;
-        } else {
-            if (cobs_state == COBS_WAIT_SYNC) {
+
+        } else { /* non-null byte */
+            if (cobs_state == COBS_WAIT_SYNC) { /* Wait for null byte */
                 /* ignore data */
-            } else if (cobs_state == COBS_WAIT_START) {
+
+            } else if (cobs_state == COBS_WAIT_START) { /* Overhead byte */
                 cobs_count = data;
                 cobs_state = COBS_RUNNING;
-            } else {
-                if (--cobs_count == 0) {
+
+            } else { /* Payload byte */
+                if (--cobs_count == 0) { /* Skip byte */
                     cobs_count = data;
                     data = 0;
                 }
 
+                /* Write processed payload byte to current receive buffer */
                 writep[rxpos++] = data;
             }
         }
@@ -486,6 +594,7 @@ int main(void) {
     RCC->CFGR |= (2<<RCC_CFGR_SW_Pos);
     SystemCoreClockUpdate();
 
+    /* Turn on lots of neat things */
     RCC->AHBENR  |= RCC_AHBENR_GPIOAEN | RCC_AHBENR_DMAEN | RCC_AHBENR_CRCEN | RCC_AHBENR_FLITFEN;
     RCC->APB2ENR |= RCC_APB2ENR_SPI1EN | RCC_APB2ENR_USART1EN | RCC_APB2ENR_SYSCFGEN | RCC_APB2ENR_ADCEN | RCC_APB2ENR_DBGMCUEN | RCC_APB2ENR_TIM1EN;
     RCC->APB1ENR |= RCC_APB1ENR_TIM3EN;
@@ -533,7 +642,7 @@ int main(void) {
     cfg_spi1();
 
     /* Pre-compute aux register values for timer ISR */
-    for (int i=0; i<sizeof(segment_map)/sizeof(segment_map[0]); i++) {
+    for (int i=0; i<NSEGMENTS; i++) {
         segment_map[i] = 0xff00 ^ (0x100<<segment_map[i]);
     }
 
@@ -543,7 +652,7 @@ int main(void) {
         read_fb->data[i] = 0xffffffff; /* FIXME DEBUG 0x00000000; */
     }
 
-    cfg_timer3();
+    cfg_timers_led();
     SysTick_Config(SystemCoreClock/1000); /* 1ms interval */
     uart_config();
     //adc_config();
@@ -555,6 +664,8 @@ int main(void) {
             k = 0;
             led_state = (led_state+1)&7;
         }
+
+        /* Process pending buffer transfer */
         if (fb_op == FB_FORMAT) {
             transpose_data(rx_buf.byte_data, write_fb);
             fb_op = FB_UPDATE;

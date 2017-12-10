@@ -17,11 +17,15 @@ def frame_packet(data):
 
 def format_packet(data):
     out = b''
-    for a, b, c, d in chunked(data, 4):
+    for a, b, c, d, e, f, g, h in chunked(data, 8):
         ah, bh, ch, dh = a>>8,   b>>8,   c>>8,   d>>8
+        eh, fh, gh, hh = e>>8,   f>>8,   g>>8,   h>>8
         al, bl, cl, dl = a&0xff, b&0xff, c&0xff, d&0xff
+        el, fl, gl, hl = e&0xff, f&0xff, g&0xff, h&0xff
         # FIXME check order of high bits
-        out += bytes([al, bl, cl, dl, (ah<<6 | bh<<4 | ch<<2 | dh<<0)&0xff])
+        out += bytes([al, bl, cl, dl, el, fl, gl, hl,
+            (ah<<6 | bh<<4 | ch<<2 | dh<<0)&0xff,
+            (eh<<6 | fh<<4 | gh<<2 | hh<<0)&0xff])
     out += bytes([1, 0, 0, 0]) # global intensity
     return out
 
@@ -44,6 +48,7 @@ if __name__ == '__main__':
             [[(i + (d//8)*8) % 256*8 for d in range(frame_len)] for i in range(256)]
 
     #frames = [red, black]*5
+    #frames = [ x for l in [[([0]*i+[255]+[0]*(7-i))*32]*2 for i in range(8)] for x in l ]
     while True:
         for i, frame in enumerate(frames):
             formatted = format_packet(frame)
