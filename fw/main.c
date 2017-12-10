@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "transpose.h"
+#include "mac.h"
 
 /* 
  * Part number: STM32F030F4C6
@@ -104,6 +105,7 @@ volatile union {
     struct __attribute__((packed)) { struct framebuf fb; uint8_t end[0]; } set_fb_rq;
     struct __attribute__((packed)) { uint8_t nbits;      uint8_t end[0]; } set_nbits_rq;
     uint8_t byte_data[0];
+    uint32_t mac_data;
 } rx_buf;
 
 volatile union {
@@ -409,6 +411,7 @@ void uart_config(void) {
 #define LED_STRETCHING_MS 50
 static volatile int error_led_timeout = 0;
 static volatile int comm_led_timeout = 0;
+static volatile int id_led_timeout = 0;
 
 void trigger_error_led() {
     error_led_timeout = LED_STRETCHING_MS;
@@ -418,32 +421,67 @@ void trigger_comm_led() {
     comm_led_timeout = LED_STRETCHING_MS;
 }
 
+void trigger_id_led() {
+    id_led_timeout = LED_STRETCHING_MS;
+}
+
 /* Error counters for debugging */
 static unsigned int overruns = 0;
 static unsigned int frame_overruns = 0;
 static unsigned int invalid = 0;
 
+void tx_char(uint8_t c) {
+    while (!(USART1->ISR & USART_ISR_TC));
+    USART1->TDR = c;
+}
+
+void send_frame_formatted(uint8_t *buf, int len) {
+    uint8_t *p=buf, *q=buf, *end=buf+len;
+    do {
+        while (*q && q!=end)
+            q++;
+        tx_char(q-p+1);
+        while (*p && p!=end)
+            tx_char(*p++);
+    } while (p != end);
+    tx_char('\0');
+}
+
 /* This is the higher-level protocol handler for the serial protocol. It gets passed the number of data bytes in this
  * frame (which may be zero) and returns a pointer to the buffer where the next frame should be stored.
  */
 volatile uint8_t *packet_received(int len) {
-    static int protocol_state = 0; 
-    /* Use zero-length frames as delimiters to synchronize this protocol layer */
-    if (len == 0) {
-        protocol_state = 0;
+    static enum {
+        PROT_EXPECT_FRAME_FIRST_HALF = 0,
+        PROT_EXPECT_FRAME_SECOND_HALF = 1,
+        PROT_IGNORE = 2,
+    } protocol_state = PROT_IGNORE; 
+    /* Use mac frames as delimiters to synchronize this protocol layer */
+    trigger_comm_led();
+    if (len == 0) { /* Discovery packet */
+        if (sys_time < 100 && sys_time_seconds == 0) { /* Only respond during the first 100ms after boot */
+            send_frame_formatted((uint8_t*)&device_mac, sizeof(device_mac));
+        }
+
+    } else if (len == 4) { /* Address packet */
+        if (rx_buf.mac_data == device_mac) { /* we are addressed */
+            protocol_state = PROT_EXPECT_FRAME_FIRST_HALF; /* start listening for frame buffer data */
+        } else { /* we are not addressed */
+            protocol_state = PROT_IGNORE; /* ignore packet */
+        }
 
     } else if (len == sizeof(rx_buf.set_fb_rq)/2) {
-        if (protocol_state == 0) { /* First of two half-framebuffer data frames */
-            protocol_state = 1;
+        if (protocol_state == PROT_EXPECT_FRAME_FIRST_HALF) { /* First of two half-framebuffer data frames */
+            protocol_state = PROT_EXPECT_FRAME_SECOND_HALF;
             /* Return second half of receive buffer */
             return rx_buf.byte_data + (sizeof(rx_buf.set_fb_rq)/2);
 
-        } else if (protocol_state == 1) { /* Second of two half-framebuffer data frames */
+        } else if (protocol_state == PROT_EXPECT_FRAME_SECOND_HALF) { /* Second of two half-framebuffer data frames */
             /* Kick off buffer transfer. This triggers the main loop to copy data out of the receive buffer and paste it
              * properly formatted into the frame buffer. */
             if (fb_op == FB_WRITE) {
                 fb_op = FB_FORMAT;
-                trigger_comm_led();
+                trigger_id_led();
             } else {
                 /* FIXME An overrun happend. What should we do? */
                 frame_overruns++;
@@ -451,14 +489,14 @@ volatile uint8_t *packet_received(int len) {
             }
 
             /* Go to "hang mode" until next zero-length packet. */
-            protocol_state = 2;
+            protocol_state = PROT_IGNORE;
         }
 
     } else {
         /* FIXME An invalid packet has been received. What should we do? */
         invalid++;
         trigger_error_led();
-        protocol_state = 2; /* go into "hang mode" until next zero-length packet */
+        protocol_state = PROT_IGNORE; /* go into "hang mode" until next zero-length packet */
     }
 
     /* By default, return rx_buf.byte_data . This means if an invalid protocol state is reached ("hang mode"), the next
@@ -720,10 +758,10 @@ int main(void) {
 
     int last_time = 0;
     while (42) {
-        /* Crude LED logic. The comm and error LEDs each have a timeout counter that is reset to the LED_STRETCHING_MS
-         * constant on an event (either a frame received correctly or some uart, framing or protocol error). These
-         * timeout counters count down in milliseconds and the LEDs are set while they are non-zero. This means a train
-         * of several very brief events will make the LED lit permanently.
+        /* Crude LED logic. The comm, id and error LEDs each have a timeout counter that is reset to the
+         * LED_STRETCHING_MS constant on an event (either a frame received correctly or some uart, framing or protocol
+         * error). These timeout counters count down in milliseconds and the LEDs are set while they are non-zero. This
+         * means a train of several very brief events will make the LED lit permanently.
          */
         int time_now = sys_time; /* Latch sys_time here to avoid race conditions */
         if (last_time != time_now) {
@@ -737,7 +775,11 @@ int main(void) {
             if (comm_led_timeout < 0)
                 comm_led_timeout = 0;
 
-            led_state = (led_state & ~3) | (!!error_led_timeout)<<1 | (!!comm_led_timeout)<<0;
+            id_led_timeout -= diff;
+            if (id_led_timeout < 0)
+                id_led_timeout = 0;
+
+            led_state = (led_state & ~7) | (!!id_led_timeout)<<2 | (!!error_led_timeout)<<1 | (!!comm_led_timeout)<<0;
             last_time = time_now;
         }
 

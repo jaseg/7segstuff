@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import serial
+from itertools import takewhile
 
 def chunked(data, chunk_size):
     for i in range(0, len(data), chunk_size):
@@ -29,15 +30,37 @@ def format_packet(data):
     out += bytes([1, 0, 0, 0]) # global intensity
     return out
 
+def chariter(ser):
+    while True:
+        yield ser.read(1)
+
+def read_frame(ser):
+    return b''.join(takewhile(lambda c: c and c[0], chariter(ser)))
+
+def unstuff(data):
+    out = b''
+    while data:
+        stuff = data[0]
+        if out:
+            out += b'\0'
+        out += data[1:stuff]
+        data = data[stuff:]
+    return out
+
+def receive_frame(ser):
+    return unstuff(read_frame(ser))
+
 if __name__ == '__main__':
     import argparse
     import time
+    import struct
+    from binascii import hexlify
     
     parser = argparse.ArgumentParser()
     parser.add_argument('serial')
     args = parser.parse_args()
 
-    ser = serial.Serial(args.serial, 2000000)
+    ser = serial.Serial(args.serial, 2000000, timeout=0.05)
 
     frame_len = 4*8*8
     black, red = [0]*frame_len, [255]*frame_len
@@ -49,10 +72,26 @@ if __name__ == '__main__':
 
     #frames = [red, black]*5
     #frames = [ x for l in [[([0]*i+[255]+[0]*(7-i))*32]*2 for i in range(8)] for x in l ]
+    found_macs = set()
+    while True:
+        ser.write(b'\0')
+        frame = receive_frame(ser)
+        if len(frame) == 4:
+            mac, = struct.unpack('<I', frame)
+            if mac not in found_macs:
+                found_macs.add(mac)
+                print('Discovered new MAC: {:08x}'.format(mac))
+                break
+        elif len(frame) != 0:
+            print('Invalid frame of length {}:'.format(len(frame)), frame)
+        time.sleep(0.05)
+
     while True:
         for i, frame in enumerate(frames):
             formatted = format_packet(frame)
-            framed = b'\0' + frame_packet(formatted[:162]) + frame_packet(formatted[162:])
+            mac, = found_macs
+            mac_packet = struct.pack('<I', mac)
+            framed = frame_packet(mac_packet) + frame_packet(formatted[:162]) + frame_packet(formatted[162:])
             print('sending', i, len(frame), len(formatted), len(framed))
             ser.write(framed)
             time.sleep(0.02)
