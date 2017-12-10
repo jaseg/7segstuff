@@ -8,6 +8,7 @@ enum {
     NROWS = 4,
     NCOLS = 8,
     MAX_BITS = 10,
+    MIN_BITS = 6,
 };
 
 enum {

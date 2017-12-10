@@ -162,8 +162,11 @@ void cfg_spi1() {
     /* FIXME maybe try w/o BIDI */
 }
 
+/* This is a lookup table mapping segments to present a standard segment order on the UART interface. This is converted
+ * into an internal representation once on startup in main(). The data type must be at least uint16. */
 uint32_t segment_map[8] = {5, 7, 6, 4, 1, 3, 0, 2};
 
+/* The value to be written into the aux register. This encompasses LED state as well as the current setting bits. */
 static volatile uint32_t aux_reg = 0;
 static volatile int frame_duration_us;
 volatile int nbits = MAX_BITS;
@@ -171,17 +174,34 @@ volatile int nbits = MAX_BITS;
 static unsigned int active_bit = 0;
 static int active_segment = 0;
 
-/* Bit timing base value. This is the lowes bit interval used */
+/* Bit timing base value. This is the lowes bit interval used in TIM1/TIM3 timer counts. */
 #define PERIOD_BASE 4
 
 /* This value is a constant offset added to every bit period to allow for the timer IRQ handler to execute. This is set
- * empirically using a debugger and a logic analyzer. */
+ * empirically using a debugger and a logic analyzer.
+ *
+ * This value is in TIM1/TIM3 timer counts. */
 #define TIMER_CYCLES_FOR_SPI_TRANSMISSIONS 9
 
+/* This value sets the point when the LED strobe is asserted after the begin of the current bit cycle and IRQ
+ * processing. This must be less than TIMER_CYCLES_FOR_SPI_TRANSMISSIONS but must be large enough to allow for the SPI
+ * transmission to reliably finish.
+ *
+ * This value is in TIM1/TIM3 timer counts. */
 #define TIMER_CYCLES_BEFORE_LED_STROBE 8
 
-#define AUX_SPI_PRETRIGGER 64
-#define ADC_PRETRIGGER 64
+/* This value sets how long the TIM1 CC IRQ used for AUX register setting etc. is triggered before the end of the
+ * longest cycle. This value should not be larger than PERIOD_BASE<<MIN_BITS to make sure the TIM1 CC IRQ does only
+ * trigger in the longest cycle no matter what nbits is set to.
+ *
+ * This value is in TIM1/TIM3 timer counts. */
+#define AUX_SPI_PRETRIGGER 64 /* trigger with about 24us margin to the end of cycle/next TIM3 IRQ */
+
+/* This value sets how long a batch of ADC conversions used for temperature measurement is started before the end of the
+ * longest cycle. Here too the above caveats apply.
+ *
+ * This value is in TIM1/TIM3 timer counts. */
+#define ADC_PRETRIGGER 150 /* trigger with about 12us margin to TIM1 CC IRQ */
 
 /* Defines for brevity */
 #define A TIMER_CYCLES_FOR_SPI_TRANSMISSIONS
@@ -230,7 +250,6 @@ void cfg_timers_led() {
      *  * Compare unit 1 triggers the interrupt handler only in the longest bit cycle. The IRQ handler
      *    * transmits the data to the auxiliary shift registers and
      *    * swaps the frame buffers if pending
-     *    * kicks off the ADC for (oversampled) temperature measurement
      *  * Compare unit 2 generates the led drivers' STROBE signal
      * 
      * The AUX_STROBE signal for the two auxiliary shift registers that deal with segment selection, current setting and
@@ -261,10 +280,12 @@ void cfg_timers_led() {
     /* Setup CC1 and CC2. CC2 generates the LED drivers' STROBE, CC1 triggers the IRQ handler */
     TIM1->BDTR  = TIM_BDTR_MOE;
     TIM1->CCMR1 = (6<<TIM_CCMR1_OC2M_Pos) | TIM_CCMR1_OC2PE; /* PWM Mode 1, enable CCR preload for AUX_STROBE */
-    TIM1->CCER  = TIM_CCER_CC1E | TIM_CCER_CC2E;
+    TIM1->CCMR2 = (6<<TIM_CCMR2_OC4M_Pos); /* PWM Mode 1 */
+    TIM1->CCER  = TIM_CCER_CC1E | TIM_CCER_CC2E | TIM_CCER_CC4E;
     TIM1->CCR2  = TIMER_CYCLES_BEFORE_LED_STROBE;
     /* Trigger at the end of the longest bit cycle. This means this does not trigger in shorter bit cycles. */
     TIM1->CCR1  = timer_period_lookup[nbits-1] - AUX_SPI_PRETRIGGER;
+    TIM1->CCR4  = timer_period_lookup[nbits-1] - ADC_PRETRIGGER;
     TIM1->DIER  = TIM_DIER_CC1IE;
 
     TIM1->ARR   = 0xffff; /* This is as large as possible since TIM1 is reset by TIM3. */
@@ -284,6 +305,7 @@ void cfg_timers_led() {
 
 void TIM1_CC_IRQHandler() {
     /* This handler takes about 1.5us */
+    GPIOA->BSRR = GPIO_BSRR_BS_0; // Debug
 
     /* Set SPI baudrate to 12.5MBd for slow-ish 74HC(T)595. This is reset again in TIM3's IRQ handler.*/
     SPI1->CR1 |= (2<<SPI_CR1_BR_Pos);
@@ -312,15 +334,16 @@ void TIM1_CC_IRQHandler() {
     GPIOA->BSRR = GPIO_BSRR_BR_10;
     /* Send AUX register data */
     SPI1->DR = aux_reg | segment_map[active_segment];
-    /* Kick off ADC for (oversampled) temperature measurement */
-    ADC1->CR |= ADC_CR_ADSTART;
 
     /* Clear interrupt flag */
     TIM1->SR &= ~TIM_SR_CC1IF_Msk;
+
+    GPIOA->BSRR = GPIO_BSRR_BR_0; // Debug
 }
 
 void TIM3_IRQHandler() {
     /* This handler takes about 2.1us */
+    GPIOA->BSRR = GPIO_BSRR_BS_0; // Debug
 
     /* Reset SPI baudrate to 25MBd for fast MBI5026. Every couple of cycles, TIM1's ISR will set this to a slower value
      * for the slower AUX registers.*/
@@ -344,6 +367,8 @@ void TIM3_IRQHandler() {
 
     /* Clear interrupt flag */
     TIM3->SR &= ~TIM_SR_UIF_Msk;
+
+    GPIOA->BSRR = GPIO_BSRR_BR_0; // Debug
 }
 
 enum Command {
@@ -476,8 +501,6 @@ void USART1_IRQHandler(void) {
     /* COBS skip counter. During payload processing this contains the remaining non-null payload bytes */
     static int cobs_count = 0;
 
-    GPIOA->BSRR = GPIO_BSRR_BS_0; // Debug
-
     if (USART1->ISR & USART_ISR_ORE) { /* Overrun handling */
         overruns++;
         /* Reset and re-synchronize. Retry next frame. */
@@ -516,26 +539,30 @@ void USART1_IRQHandler(void) {
             }
         }
     }
-
-    GPIOA->BSRR = GPIO_BSRR_BR_0; // Debug
 }
 
 #define ADC_OVERSAMPLING 4
 uint32_t vsense;
 void DMA1_Channel1_IRQHandler(void) {
+    /* This interrupt takes either 1.2us or 13us. It can be pre-empted by the more timing-critical UART and LED timer
+     * interrupts. */
     GPIOA->BSRR = GPIO_BSRR_BS_4; // Debug
-    static int count = 0;
-    static uint32_t adc_aggregate[2] = {0, 0};
+    static int count = 0; /* oversampling accumulator sample count */
+    static uint32_t adc_aggregate[2] = {0, 0}; /* oversampling accumulator */
 
+    /* Clear the interrupt flag */
     DMA1->IFCR |= DMA_IFCR_CGIF1;
 
     adc_aggregate[0] += adc_buf[0];
     adc_aggregate[1] += adc_buf[1];
 
     if (count++ == (1<<ADC_OVERSAMPLING)) {
+        /* This has been cobbled together from online tutorials and ST documentation. The datasheet is pretty poor on
+         * this. */
         adc_vcc_mv = (3300 * VREFINT_CAL)/(adc_aggregate[0]>>ADC_OVERSAMPLING);
         vsense = ((adc_aggregate[1]>>ADC_OVERSAMPLING) * adc_vcc_mv)/4095 ;
         adc_temp_tenth_celsius = 300 - (((TS_CAL1*adc_vcc_mv/4095) - vsense)*100)/43;
+        /* Reset oversampling state */
         count = 0;
         adc_aggregate[0] = 0;
         adc_aggregate[1] = 0;
@@ -544,29 +571,43 @@ void DMA1_Channel1_IRQHandler(void) {
 }
 
 void adc_config(void) {
-    ADC1->CFGR1 = ADC_CFGR1_DMAEN | ADC_CFGR1_DMACFG;
-    ADC1->CFGR2 = (1<<ADC_CFGR2_CKMODE_Pos);
-    ADC1->SMPR = (7<<ADC_SMPR_SMP_Pos);
+    /* The ADC is used for temperature measurement. To compute the temperature from an ADC reading of the internal
+     * temperature sensor, the supply voltage must also be measured. Thus we are using two channels.
+     *
+     * The ADC is triggered by compare channel 4 of timer 1. The trigger is set to falling edge to trigger on compare
+     * match, not overflow.
+     */
+    ADC1->CFGR1 = ADC_CFGR1_DMAEN | ADC_CFGR1_DMACFG | (2<<ADC_CFGR1_EXTEN_Pos) | (1<<ADC_CFGR1_EXTSEL_Pos);
+    /* Clock from PCLK/4 instead of the internal exclusive high-speed RC oscillator. */
+    ADC1->CFGR2 = (2<<ADC_CFGR2_CKMODE_Pos);
+    /* Use the slowest available sample rate */
+    ADC1->SMPR  = (7<<ADC_SMPR_SMP_Pos);
+    /* Internal VCC and temperature sensor channels */
     ADC1->CHSELR = ADC_CHSELR_CHSEL16 | ADC_CHSELR_CHSEL17;
+    /* Enable internal voltage reference and temperature sensor */
     ADC->CCR = ADC_CCR_TSEN | ADC_CCR_VREFEN;
+    /* Perform ADC calibration */
     ADC1->CR |= ADC_CR_ADCAL;
     while (ADC1->CR & ADC_CR_ADCAL)
         ;
+    /* Enable ADC */
     ADC1->CR |= ADC_CR_ADEN;
-    /* FIXME handle adc overrun */
+    ADC1->CR |= ADC_CR_ADSTART;
 
+    /* Configure DMA 1 Channel 1 to get rid of all the data */
     DMA1_Channel1->CPAR = (unsigned int)&ADC1->DR;
     DMA1_Channel1->CMAR = (unsigned int)&adc_buf;
     DMA1_Channel1->CNDTR = sizeof(adc_buf)/sizeof(adc_buf[0]);
     DMA1_Channel1->CCR = (0<<DMA_CCR_PL_Pos);
     DMA1_Channel1->CCR |=
-          DMA_CCR_CIRC
+          DMA_CCR_CIRC /* circular mode so we can leave it running indefinitely */
         | (1<<DMA_CCR_MSIZE_Pos) /* 16 bit */
         | (1<<DMA_CCR_PSIZE_Pos) /* 16 bit */
         | DMA_CCR_MINC
-        | DMA_CCR_TCIE;
-    DMA1_Channel1->CCR |= DMA_CCR_EN;
+        | DMA_CCR_TCIE; /* Enable transfer complete interrupt. */
+    DMA1_Channel1->CCR |= DMA_CCR_EN; /* Enable channel */
 
+    /* triggered on transfer completion. We use this to process the ADC data */
     NVIC_EnableIRQ(DMA1_Channel1_IRQn);
     NVIC_SetPriority(DMA1_Channel1_IRQn, 3);
 }
