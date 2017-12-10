@@ -83,8 +83,8 @@ void strobe_leds(void) {
     GPIOA->BSRR = GPIO_BSRR_BR_9;
 }
 
-#define FIRMWARE_VERSION 1
-#define HARDWARE_VERSION 1
+#define FIRMWARE_VERSION 2
+#define HARDWARE_VERSION 4
 
 #define TS_CAL1 (*(uint16_t *)0x1FFFF7B8)
 #define VREFINT_CAL (*(uint16_t *)0x1FFFF7BA)
@@ -107,23 +107,6 @@ volatile union {
     uint8_t byte_data[0];
     uint32_t mac_data;
 } rx_buf;
-
-volatile union {
-    struct { uint32_t magic;    } ping_reply;
-    struct __attribute__((packed)) {
-        uint8_t  firmware_version,
-                 hardware_version,
-                 digit_rows,
-                 digit_cols;
-        uint32_t uptime;
-        uint32_t millifps;
-         int16_t vcc_mv,
-                 temp_tenth_celsius;
-        uint8_t  nbits;
-    } desc_reply;
-} tx_buf;
-
-extern uint8_t bus_addr;
 
 #define LED_COMM     0x0001
 #define LED_ERROR    0x0002
@@ -372,14 +355,6 @@ void TIM3_IRQHandler() {
     GPIOA->BSRR = GPIO_BSRR_BR_0; // Debug
 }
 
-enum Command {
-    CMD_PING,
-    CMD_SET_FB,
-    CMD_SET_NBITS,
-    CMD_GET_DESC,
-    N_CMDS
-};
-
 void uart_config(void) {
     USART1->CR1 = /* 8-bit -> M1, M0 clear */
         /* RTOIE clear */
@@ -426,9 +401,9 @@ void trigger_id_led() {
 }
 
 /* Error counters for debugging */
-static unsigned int overruns = 0;
+static unsigned int uart_overruns = 0;
 static unsigned int frame_overruns = 0;
-static unsigned int invalid = 0;
+static unsigned int invalid_frames = 0;
 
 void tx_char(uint8_t c) {
     while (!(USART1->ISR & USART_ISR_TC));
@@ -443,8 +418,43 @@ void send_frame_formatted(uint8_t *buf, int len) {
         tx_char(q-p+1);
         while (*p && p!=end)
             tx_char(*p++);
-    } while (p != end);
+        p++, q++;
+    } while (p < end);
     tx_char('\0');
+}
+
+union {
+    struct __attribute__((packed)) {
+        uint8_t  firmware_version,
+                 hardware_version,
+                 digit_rows,
+                 digit_cols;
+        uint32_t uptime_s,
+                 framerate_millifps,
+                 uart_overruns,
+                 frame_overruns,
+                 invalid_frames;
+         int16_t vcc_mv,
+                 temp_celsius;
+         uint8_t nbits;
+    } desc_reply;
+    uint8_t byte_data[0];
+} tx_buf;
+
+void send_status_reply(void) {
+    tx_buf.desc_reply.firmware_version = FIRMWARE_VERSION;
+    tx_buf.desc_reply.hardware_version = HARDWARE_VERSION;
+    tx_buf.desc_reply.digit_rows = NROWS;
+    tx_buf.desc_reply.digit_cols = NCOLS;
+    tx_buf.desc_reply.uptime_s = sys_time_seconds;
+    tx_buf.desc_reply.vcc_mv = adc_vcc_mv;
+    tx_buf.desc_reply.temp_celsius = adc_temp_celsius;
+    tx_buf.desc_reply.nbits = nbits;
+    tx_buf.desc_reply.framerate_millifps = frame_duration_us > 0 ? 1000000000 / frame_duration_us : 0;
+    tx_buf.desc_reply.uart_overruns = uart_overruns;
+    tx_buf.desc_reply.frame_overruns = frame_overruns;
+    tx_buf.desc_reply.invalid_frames = invalid_frames;
+    send_frame_formatted(tx_buf.byte_data, sizeof(tx_buf.desc_reply));
 }
 
 /* This is the higher-level protocol handler for the serial protocol. It gets passed the number of data bytes in this
@@ -452,7 +462,7 @@ void send_frame_formatted(uint8_t *buf, int len) {
  */
 volatile uint8_t *packet_received(int len) {
     static enum {
-        PROT_EXPECT_FRAME_FIRST_HALF = 0,
+        PROT_ADDRESSED = 0,
         PROT_EXPECT_FRAME_SECOND_HALF = 1,
         PROT_IGNORE = 2,
     } protocol_state = PROT_IGNORE; 
@@ -463,15 +473,32 @@ volatile uint8_t *packet_received(int len) {
             send_frame_formatted((uint8_t*)&device_mac, sizeof(device_mac));
         }
 
+    } else if (len == 1) { /* Command packet */
+        if (protocol_state == PROT_ADDRESSED) {
+            switch (rx_buf.byte_data[0]) {
+            case 0x01:
+                GPIOA->BSRR = GPIO_BSRR_BS_4; // Debug
+                //for (int i=0; i<100; i++)
+                //    tick();
+                send_status_reply();
+                GPIOA->BSRR = GPIO_BSRR_BR_4; // Debug
+                break;
+            }
+        } else {
+            invalid_frames++;
+            trigger_error_led();
+        }
+        protocol_state = PROT_IGNORE;
+
     } else if (len == 4) { /* Address packet */
         if (rx_buf.mac_data == device_mac) { /* we are addressed */
-            protocol_state = PROT_EXPECT_FRAME_FIRST_HALF; /* start listening for frame buffer data */
+            protocol_state = PROT_ADDRESSED; /* start listening for frame buffer data */
         } else { /* we are not addressed */
             protocol_state = PROT_IGNORE; /* ignore packet */
         }
 
     } else if (len == sizeof(rx_buf.set_fb_rq)/2) {
-        if (protocol_state == PROT_EXPECT_FRAME_FIRST_HALF) { /* First of two half-framebuffer data frames */
+        if (protocol_state == PROT_ADDRESSED) { /* First of two half-framebuffer data frames */
             protocol_state = PROT_EXPECT_FRAME_SECOND_HALF;
             /* Return second half of receive buffer */
             return rx_buf.byte_data + (sizeof(rx_buf.set_fb_rq)/2);
@@ -494,7 +521,7 @@ volatile uint8_t *packet_received(int len) {
 
     } else {
         /* FIXME An invalid packet has been received. What should we do? */
-        invalid++;
+        invalid_frames++;
         trigger_error_led();
         protocol_state = PROT_IGNORE; /* go into "hang mode" until next zero-length packet */
     }
@@ -553,9 +580,8 @@ void USART1_IRQHandler(void) {
     /* COBS skip counter. During payload processing this contains the remaining non-null payload bytes */
     static int cobs_count = 0;
 
-    GPIOA->BSRR = GPIO_BSRR_BS_4; // Debug
     if (USART1->ISR & USART_ISR_ORE) { /* Overrun handling */
-        overruns++;
+        uart_overruns++;
         trigger_error_led();
         /* Reset and re-synchronize. Retry next frame. */
         rxpos = 0;
@@ -593,7 +619,6 @@ void USART1_IRQHandler(void) {
             }
         }
     }
-    GPIOA->BSRR = GPIO_BSRR_BR_4; // Debug
 }
 
 #define ADC_OVERSAMPLING 8
@@ -668,18 +693,6 @@ void adc_config(void) {
     NVIC_EnableIRQ(DMA1_Channel1_IRQn);
     NVIC_SetPriority(DMA1_Channel1_IRQn, 3);
 }
-
-/*
-    tx_buf.desc_reply.firmware_version = FIRMWARE_VERSION;
-    tx_buf.desc_reply.hardware_version = HARDWARE_VERSION;
-    tx_buf.desc_reply.digit_rows = NROWS;
-    tx_buf.desc_reply.digit_cols = NCOLS;
-    tx_buf.desc_reply.uptime = sys_time_seconds;
-    tx_buf.desc_reply.vcc_mv = adc_vcc_mv;
-    tx_buf.desc_reply.temp_tenth_celsius = adc_temp_tenth_celsius;
-    tx_buf.desc_reply.nbits = nbits;
-    tx_buf.desc_reply.millifps = frame_duration_us > 0 ? 1000000000 / frame_duration_us : 0;
-*/
 
 int main(void) {
     RCC->CR |= RCC_CR_HSEON;

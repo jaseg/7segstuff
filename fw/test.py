@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import serial
+import struct
 from itertools import takewhile
 
 def chunked(data, chunk_size):
@@ -50,10 +51,12 @@ def unstuff(data):
 def receive_frame(ser):
     return unstuff(read_frame(ser))
 
+def mac_frame(mac):
+    return frame_packet(struct.pack('<I', mac))
+
 def send_framebuffer(ser, mac, frame):
     formatted = format_packet(frame)
-    mac_packet = struct.pack('<I', mac)
-    framed = frame_packet(mac_packet) + frame_packet(formatted[:162]) + frame_packet(formatted[162:])
+    framed = mac_frame(mac) + frame_packet(formatted[:162]) + frame_packet(formatted[162:])
     ser.write(framed)
 
 def discover_macs(ser, count=20):
@@ -72,10 +75,32 @@ def discover_macs(ser, count=20):
             print('Invalid frame of length {}:'.format(len(frame)), frame)
         time.sleep(0.05)
 
+def parse_status_frame(frame):
+    print('frame len:', len(frame))
+    (   firmware_version, 
+        hardware_version, 
+        digit_rows, 
+        digit_cols, 
+        uptime_s, 
+        framerate_millifps, 
+        uart_overruns, 
+        frame_overruns, 
+        invalid_frames, 
+        vcc_mv, 
+        temp_celsius, 
+        nbits ) = struct.unpack('<4B5IhhB', frame)
+    del frame
+    return locals()
+
+def fetch_status(ser, mac):
+    ser.flushInput()
+    ser.write(mac_frame(mac))
+    ser.write(frame_packet(b'\x01'))
+    return parse_status_frame(receive_frame(ser))
+
 if __name__ == '__main__':
     import argparse
     import time
-    import struct
     from binascii import hexlify
     
     parser = argparse.ArgumentParser()
@@ -95,10 +120,15 @@ if __name__ == '__main__':
     #frames = [red, black]*5
     #frames = [ x for l in [[([0]*i+[255]+[0]*(7-i))*32]*2 for i in range(8)] for x in l ]
     found_macs = discover_macs(ser, 1)
+    mac, = found_macs
+
+    import pprint
+    while True:
+        pprint.pprint(fetch_status(ser, mac))
+        time.sleep(0.02)
 
     while True:
         for i, frame in enumerate(frames):
-            mac, = found_macs
             send_framebuffer(ser, mac, frame)
             print('sending', i, len(frame))
             time.sleep(0.02)
