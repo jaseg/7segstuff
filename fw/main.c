@@ -181,6 +181,7 @@ static int active_segment = 0;
 #define TIMER_CYCLES_BEFORE_LED_STROBE 8
 
 #define AUX_SPI_PRETRIGGER 64
+#define ADC_PRETRIGGER 64
 
 /* Defines for brevity */
 #define A TIMER_CYCLES_FOR_SPI_TRANSMISSIONS
@@ -229,6 +230,7 @@ void cfg_timers_led() {
      *  * Compare unit 1 triggers the interrupt handler only in the longest bit cycle. The IRQ handler
      *    * transmits the data to the auxiliary shift registers and
      *    * swaps the frame buffers if pending
+     *    * kicks off the ADC for (oversampled) temperature measurement
      *  * Compare unit 2 generates the led drivers' STROBE signal
      * 
      * The AUX_STROBE signal for the two auxiliary shift registers that deal with segment selection, current setting and
@@ -256,10 +258,10 @@ void cfg_timers_led() {
     TIM1->PSC   = TIM3->PSC;
     TIM1->SMCR  = (2<<TIM_SMCR_TS_Pos) | (4<<TIM_SMCR_SMS_Pos); /* Internal Trigger 2 (ITR2) -> TIM3; slave mode: reset */
 
-    /* Setup CC1 and CC2. CC2 generates the LED drivers' STROBE, CC1 triggers the IRQ handler. */
+    /* Setup CC1 and CC2. CC2 generates the LED drivers' STROBE, CC1 triggers the IRQ handler */
     TIM1->BDTR  = TIM_BDTR_MOE;
     TIM1->CCMR1 = (6<<TIM_CCMR1_OC2M_Pos) | TIM_CCMR1_OC2PE; /* PWM Mode 1, enable CCR preload for AUX_STROBE */
-    TIM1->CCER  = TIM_CCER_CC2E | TIM_CCER_CC1E;
+    TIM1->CCER  = TIM_CCER_CC1E | TIM_CCER_CC2E;
     TIM1->CCR2  = TIMER_CYCLES_BEFORE_LED_STROBE;
     /* Trigger at the end of the longest bit cycle. This means this does not trigger in shorter bit cycles. */
     TIM1->CCR1  = timer_period_lookup[nbits-1] - AUX_SPI_PRETRIGGER;
@@ -274,15 +276,14 @@ void cfg_timers_led() {
 
     /* Sends aux data and swaps frame buffers if necessary */
     NVIC_EnableIRQ(TIM1_CC_IRQn);
-    NVIC_SetPriority(TIM1_CC_IRQn, 2);
+    NVIC_SetPriority(TIM1_CC_IRQn, 0);
     /* Sends LED data and sets up the next bit cycle's timings */
     NVIC_EnableIRQ(TIM3_IRQn);
-    NVIC_SetPriority(TIM3_IRQn, 2);
+    NVIC_SetPriority(TIM3_IRQn, 0);
 }
 
 void TIM1_CC_IRQHandler() {
     /* This handler takes about 1.5us */
-    GPIOA->BSRR = GPIO_BSRR_BS_4; // Debug
 
     /* Set SPI baudrate to 12.5MBd for slow-ish 74HC(T)595. This is reset again in TIM3's IRQ handler.*/
     SPI1->CR1 |= (2<<SPI_CR1_BR_Pos);
@@ -311,15 +312,15 @@ void TIM1_CC_IRQHandler() {
     GPIOA->BSRR = GPIO_BSRR_BR_10;
     /* Send AUX register data */
     SPI1->DR = aux_reg | segment_map[active_segment];
+    /* Kick off ADC for (oversampled) temperature measurement */
+    ADC1->CR |= ADC_CR_ADSTART;
 
     /* Clear interrupt flag */
     TIM1->SR &= ~TIM_SR_CC1IF_Msk;
-    GPIOA->BSRR = GPIO_BSRR_BR_4; // Debug
 }
 
 void TIM3_IRQHandler() {
     /* This handler takes about 2.1us */
-    GPIOA->BSRR = GPIO_BSRR_BS_4; // Debug
 
     /* Reset SPI baudrate to 25MBd for fast MBI5026. Every couple of cycles, TIM1's ISR will set this to a slower value
      * for the slower AUX registers.*/
@@ -343,7 +344,6 @@ void TIM3_IRQHandler() {
 
     /* Clear interrupt flag */
     TIM3->SR &= ~TIM_SR_UIF_Msk;
-    GPIOA->BSRR = GPIO_BSRR_BR_4; // Debug
 }
 
 enum Command {
@@ -353,18 +353,6 @@ enum Command {
     CMD_GET_DESC,
     N_CMDS
 };
-
-/*
-    tx_buf.desc_reply.firmware_version = FIRMWARE_VERSION;
-    tx_buf.desc_reply.hardware_version = HARDWARE_VERSION;
-    tx_buf.desc_reply.digit_rows = NROWS;
-    tx_buf.desc_reply.digit_cols = NCOLS;
-    tx_buf.desc_reply.uptime = sys_time_seconds;
-    tx_buf.desc_reply.vcc_mv = adc_vcc_mv;
-    tx_buf.desc_reply.temp_tenth_celsius = adc_temp_tenth_celsius;
-    tx_buf.desc_reply.nbits = nbits;
-    tx_buf.desc_reply.millifps = frame_duration_us > 0 ? 1000000000 / frame_duration_us : 0;
-*/
 
 void uart_config(void) {
     USART1->CR1 = /* 8-bit -> M1, M0 clear */
@@ -391,7 +379,7 @@ void uart_config(void) {
 
     /* Enable receive interrupt */
     NVIC_EnableIRQ(USART1_IRQn);
-    NVIC_SetPriority(USART1_IRQn, 3);
+    NVIC_SetPriority(USART1_IRQn, 1);
 }
 
 /* Error counters for debugging */
@@ -532,9 +520,10 @@ void USART1_IRQHandler(void) {
     GPIOA->BSRR = GPIO_BSRR_BR_0; // Debug
 }
 
-#define ADC_OVERSAMPLING 12
+#define ADC_OVERSAMPLING 4
 uint32_t vsense;
 void DMA1_Channel1_IRQHandler(void) {
+    GPIOA->BSRR = GPIO_BSRR_BS_4; // Debug
     static int count = 0;
     static uint32_t adc_aggregate[2] = {0, 0};
 
@@ -551,19 +540,19 @@ void DMA1_Channel1_IRQHandler(void) {
         adc_aggregate[0] = 0;
         adc_aggregate[1] = 0;
     }
+    GPIOA->BSRR = GPIO_BSRR_BR_4; // Debug
 }
 
 void adc_config(void) {
-    ADC1->CFGR1 = ADC_CFGR1_CONT | ADC_CFGR1_DMAEN | ADC_CFGR1_DMACFG;
-    ADC1->CFGR2 = 2<<ADC_CFGR2_CKMODE_Pos;
-    ADC1->SMPR = 7<<ADC_SMPR_SMP_Pos;
+    ADC1->CFGR1 = ADC_CFGR1_DMAEN | ADC_CFGR1_DMACFG;
+    ADC1->CFGR2 = (1<<ADC_CFGR2_CKMODE_Pos);
+    ADC1->SMPR = (7<<ADC_SMPR_SMP_Pos);
     ADC1->CHSELR = ADC_CHSELR_CHSEL16 | ADC_CHSELR_CHSEL17;
     ADC->CCR = ADC_CCR_TSEN | ADC_CCR_VREFEN;
     ADC1->CR |= ADC_CR_ADCAL;
     while (ADC1->CR & ADC_CR_ADCAL)
         ;
     ADC1->CR |= ADC_CR_ADEN;
-    ADC1->CR |= ADC_CR_ADSTART;
     /* FIXME handle adc overrun */
 
     DMA1_Channel1->CPAR = (unsigned int)&ADC1->DR;
@@ -579,8 +568,20 @@ void adc_config(void) {
     DMA1_Channel1->CCR |= DMA_CCR_EN;
 
     NVIC_EnableIRQ(DMA1_Channel1_IRQn);
-    NVIC_SetPriority(DMA1_Channel1_IRQn, 6);
+    NVIC_SetPriority(DMA1_Channel1_IRQn, 3);
 }
+
+/*
+    tx_buf.desc_reply.firmware_version = FIRMWARE_VERSION;
+    tx_buf.desc_reply.hardware_version = HARDWARE_VERSION;
+    tx_buf.desc_reply.digit_rows = NROWS;
+    tx_buf.desc_reply.digit_cols = NCOLS;
+    tx_buf.desc_reply.uptime = sys_time_seconds;
+    tx_buf.desc_reply.vcc_mv = adc_vcc_mv;
+    tx_buf.desc_reply.temp_tenth_celsius = adc_temp_tenth_celsius;
+    tx_buf.desc_reply.nbits = nbits;
+    tx_buf.desc_reply.millifps = frame_duration_us > 0 ? 1000000000 / frame_duration_us : 0;
+*/
 
 int main(void) {
     RCC->CR |= RCC_CR_HSEON;
@@ -655,7 +656,7 @@ int main(void) {
     cfg_timers_led();
     SysTick_Config(SystemCoreClock/1000); /* 1ms interval */
     uart_config();
-    //adc_config();
+    adc_config();
 
     int k=0;
     while (42) {
