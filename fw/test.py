@@ -50,6 +50,28 @@ def unstuff(data):
 def receive_frame(ser):
     return unstuff(read_frame(ser))
 
+def send_framebuffer(ser, mac, frame):
+    formatted = format_packet(frame)
+    mac_packet = struct.pack('<I', mac)
+    framed = frame_packet(mac_packet) + frame_packet(formatted[:162]) + frame_packet(formatted[162:])
+    ser.write(framed)
+
+def discover_macs(ser, count=20):
+    found_macs = []
+    while True:
+        ser.write(b'\0')
+        frame = receive_frame(ser)
+        if len(frame) == 4:
+            mac, = struct.unpack('<I', frame)
+            if mac not in found_macs:
+                print('Discovered new MAC: {:2} {:08x}'.format(len(found_macs), mac))
+                found_macs.append(mac)
+                if len(found_macs) == count:
+                    return found_macs
+        elif len(frame) != 0:
+            print('Invalid frame of length {}:'.format(len(frame)), frame)
+        time.sleep(0.05)
+
 if __name__ == '__main__':
     import argparse
     import time
@@ -72,27 +94,12 @@ if __name__ == '__main__':
 
     #frames = [red, black]*5
     #frames = [ x for l in [[([0]*i+[255]+[0]*(7-i))*32]*2 for i in range(8)] for x in l ]
-    found_macs = set()
-    while True:
-        ser.write(b'\0')
-        frame = receive_frame(ser)
-        if len(frame) == 4:
-            mac, = struct.unpack('<I', frame)
-            if mac not in found_macs:
-                found_macs.add(mac)
-                print('Discovered new MAC: {:08x}'.format(mac))
-                break
-        elif len(frame) != 0:
-            print('Invalid frame of length {}:'.format(len(frame)), frame)
-        time.sleep(0.05)
+    found_macs = discover_macs(ser, 1)
 
     while True:
         for i, frame in enumerate(frames):
-            formatted = format_packet(frame)
             mac, = found_macs
-            mac_packet = struct.pack('<I', mac)
-            framed = frame_packet(mac_packet) + frame_packet(formatted[:162]) + frame_packet(formatted[162:])
-            print('sending', i, len(frame), len(formatted), len(framed))
-            ser.write(framed)
+            send_framebuffer(ser, mac, frame)
+            print('sending', i, len(frame))
             time.sleep(0.02)
         # to produce framing errors: ser.write(b'\02a\0')
