@@ -407,6 +407,18 @@ void uart_config(void) {
     NVIC_SetPriority(USART1_IRQn, 1);
 }
 
+#define LED_STRETCHING_MS 50
+static volatile int error_led_timeout = 0;
+static volatile int comm_led_timeout = 0;
+
+void trigger_error_led() {
+    error_led_timeout = LED_STRETCHING_MS;
+}
+
+void trigger_comm_led() {
+    comm_led_timeout = LED_STRETCHING_MS;
+}
+
 /* Error counters for debugging */
 static unsigned int overruns = 0;
 static unsigned int frame_overruns = 0;
@@ -432,9 +444,11 @@ volatile uint8_t *packet_received(int len) {
              * properly formatted into the frame buffer. */
             if (fb_op == FB_WRITE) {
                 fb_op = FB_FORMAT;
+                trigger_comm_led();
             } else {
                 /* FIXME An overrun happend. What should we do? */
                 frame_overruns++;
+                trigger_error_led();
             }
 
             /* Go to "hang mode" until next zero-length packet. */
@@ -444,6 +458,7 @@ volatile uint8_t *packet_received(int len) {
     } else {
         /* FIXME An invalid packet has been received. What should we do? */
         invalid++;
+        trigger_error_led();
         protocol_state = 2; /* go into "hang mode" until next zero-length packet */
     }
 
@@ -503,6 +518,7 @@ void USART1_IRQHandler(void) {
 
     if (USART1->ISR & USART_ISR_ORE) { /* Overrun handling */
         overruns++;
+        trigger_error_led();
         /* Reset and re-synchronize. Retry next frame. */
         rxpos = 0;
         cobs_state = COBS_WAIT_SYNC;
@@ -703,12 +719,24 @@ int main(void) {
     uart_config();
     adc_config();
 
-    int k=0;
+    int last_time = 0;
     while (42) {
         aux_reg = (read_fb->brightness ? SR_ILED_HIGH : SR_ILED_LOW) | (led_state<<1);
-        if (k++ == 1000000) {
-            k = 0;
-            led_state = (led_state+1)&7;
+
+        int time_now = sys_time;
+        if (last_time != time_now) {
+            int diff = (time_now - last_time);
+
+            error_led_timeout -= diff;
+            if (error_led_timeout < 0)
+                error_led_timeout = 0;
+
+            comm_led_timeout -= diff;
+            if (comm_led_timeout < 0)
+                comm_led_timeout = 0;
+
+            led_state = 0<<2 | (!!error_led_timeout)<<1 | (!!comm_led_timeout)<<0;
+            last_time = time_now;
         }
 
         /* Process pending buffer transfer */

@@ -56,3 +56,4 @@ if __name__ == '__main__':
             print('sending', i, len(frame), len(formatted), len(framed))
             ser.write(framed)
             time.sleep(0.02)
+        # to produce framing errors: ser.write(b'\02a\0')
