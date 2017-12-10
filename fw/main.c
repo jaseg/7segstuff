@@ -166,8 +166,6 @@ void cfg_spi1() {
  * into an internal representation once on startup in main(). The data type must be at least uint16. */
 uint32_t segment_map[8] = {5, 7, 6, 4, 1, 3, 0, 2};
 
-/* The value to be written into the aux register. This encompasses LED state as well as the current setting bits. */
-static volatile uint32_t aux_reg = 0;
 static volatile int frame_duration_us;
 volatile int nbits = MAX_BITS;
 
@@ -333,6 +331,7 @@ void TIM1_CC_IRQHandler() {
     /* Reset aux strobe */
     GPIOA->BSRR = GPIO_BSRR_BR_10;
     /* Send AUX register data */
+    uint32_t aux_reg = (read_fb->brightness ? SR_ILED_HIGH : SR_ILED_LOW) | (led_state<<1);
     SPI1->DR = aux_reg | segment_map[active_segment];
 
     /* Clear interrupt flag */
@@ -516,6 +515,7 @@ void USART1_IRQHandler(void) {
     /* COBS skip counter. During payload processing this contains the remaining non-null payload bytes */
     static int cobs_count = 0;
 
+    GPIOA->BSRR = GPIO_BSRR_BS_4; // Debug
     if (USART1->ISR & USART_ISR_ORE) { /* Overrun handling */
         overruns++;
         trigger_error_led();
@@ -555,6 +555,7 @@ void USART1_IRQHandler(void) {
             }
         }
     }
+    GPIOA->BSRR = GPIO_BSRR_BR_4; // Debug
 }
 
 #define ADC_OVERSAMPLING 8
@@ -562,7 +563,6 @@ uint32_t vsense;
 void DMA1_Channel1_IRQHandler(void) {
     /* This interrupt takes either 1.2us or 13us. It can be pre-empted by the more timing-critical UART and LED timer
      * interrupts. */
-    GPIOA->BSRR = GPIO_BSRR_BS_4; // Debug
     static int count = 0; /* oversampling accumulator sample count */
     static uint32_t adc_aggregate[2] = {0, 0}; /* oversampling accumulator */
 
@@ -587,7 +587,6 @@ void DMA1_Channel1_IRQHandler(void) {
         adc_aggregate[0] = 0;
         adc_aggregate[1] = 0;
     }
-    GPIOA->BSRR = GPIO_BSRR_BR_4; // Debug
 }
 
 void adc_config(void) {
@@ -721,9 +720,12 @@ int main(void) {
 
     int last_time = 0;
     while (42) {
-        aux_reg = (read_fb->brightness ? SR_ILED_HIGH : SR_ILED_LOW) | (led_state<<1);
-
-        int time_now = sys_time;
+        /* Crude LED logic. The comm and error LEDs each have a timeout counter that is reset to the LED_STRETCHING_MS
+         * constant on an event (either a frame received correctly or some uart, framing or protocol error). These
+         * timeout counters count down in milliseconds and the LEDs are set while they are non-zero. This means a train
+         * of several very brief events will make the LED lit permanently.
+         */
+        int time_now = sys_time; /* Latch sys_time here to avoid race conditions */
         if (last_time != time_now) {
             int diff = (time_now - last_time);
 
@@ -735,7 +737,7 @@ int main(void) {
             if (comm_led_timeout < 0)
                 comm_led_timeout = 0;
 
-            led_state = 0<<2 | (!!error_led_timeout)<<1 | (!!comm_led_timeout)<<0;
+            led_state = (led_state & ~3) | (!!error_led_timeout)<<1 | (!!comm_led_timeout)<<0;
             last_time = time_now;
         }
 
