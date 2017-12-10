@@ -89,7 +89,7 @@ void strobe_leds(void) {
 #define VREFINT_CAL (*(uint16_t *)0x1FFFF7BA)
 
 volatile  int16_t adc_vcc_mv = 0;
-volatile  int16_t adc_temp_tenth_celsius = 0;
+volatile  int16_t adc_temp_celsius = 0;
 
 volatile uint16_t adc_buf[2];
 
@@ -541,7 +541,7 @@ void USART1_IRQHandler(void) {
     }
 }
 
-#define ADC_OVERSAMPLING 4
+#define ADC_OVERSAMPLING 8
 uint32_t vsense;
 void DMA1_Channel1_IRQHandler(void) {
     /* This interrupt takes either 1.2us or 13us. It can be pre-empted by the more timing-critical UART and LED timer
@@ -556,13 +556,17 @@ void DMA1_Channel1_IRQHandler(void) {
     adc_aggregate[0] += adc_buf[0];
     adc_aggregate[1] += adc_buf[1];
 
-    if (count++ == (1<<ADC_OVERSAMPLING)) {
-        /* This has been cobbled together from online tutorials and ST documentation. The datasheet is pretty poor on
-         * this. */
+    if (++count == (1<<ADC_OVERSAMPLING)) {
+        /* This has been copied from the code examples to section 12.9 ADC>"Temperature sensor and internal reference
+         * voltage" in the reference manual with the extension that we actually measure the supply voltage instead of
+         * hardcoding it. This is not strictly necessary since we're running off a bored little LDO but it's free and
+         * the current supply voltage is a nice health value.
+         */
         adc_vcc_mv = (3300 * VREFINT_CAL)/(adc_aggregate[0]>>ADC_OVERSAMPLING);
-        vsense = ((adc_aggregate[1]>>ADC_OVERSAMPLING) * adc_vcc_mv)/4095 ;
-        adc_temp_tenth_celsius = 300 - (((TS_CAL1*adc_vcc_mv/4095) - vsense)*100)/43;
-        /* Reset oversampling state */
+        int32_t temperature = (((uint32_t)TS_CAL1) - ((adc_aggregate[1]>>ADC_OVERSAMPLING) * adc_vcc_mv / 3300)) * 1000;
+        temperature = (temperature/5336) + 30;
+        adc_temp_celsius = temperature;
+
         count = 0;
         adc_aggregate[0] = 0;
         adc_aggregate[1] = 0;
