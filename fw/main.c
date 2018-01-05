@@ -1,5 +1,4 @@
-
-
+/* Workaround for sub-par ST libraries */
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
 #include <stm32f0xx.h>
@@ -17,72 +16,9 @@
 #include "transpose.h"
 #include "mac.h"
 
-/* 
- * Part number: STM32F030F4C6
- */
+/* Microcontroller part number: STM32F030F4C6 */
 
-typedef struct
-{
-  volatile uint32_t CTRL;                   /*!< Offset: 0x000 (R/W)  Control Register */
-  volatile uint32_t CYCCNT;                 /*!< Offset: 0x004 (R/W)  Cycle Count Register */
-  volatile uint32_t CPICNT;                 /*!< Offset: 0x008 (R/W)  CPI Count Register */
-  volatile uint32_t EXCCNT;                 /*!< Offset: 0x00C (R/W)  Exception Overhead Count Register */
-  volatile uint32_t SLEEPCNT;               /*!< Offset: 0x010 (R/W)  Sleep Count Register */
-  volatile uint32_t LSUCNT;                 /*!< Offset: 0x014 (R/W)  LSU Count Register */
-  volatile uint32_t FOLDCNT;                /*!< Offset: 0x018 (R/W)  Folded-instruction Count Register */
-  volatile uint32_t PCSR;                   /*!< Offset: 0x01C (R/ )  Program Counter Sample Register */
-  volatile uint32_t COMP0;                  /*!< Offset: 0x020 (R/W)  Comparator Register 0 */
-  volatile uint32_t MASK0;                  /*!< Offset: 0x024 (R/W)  Mask Register 0 */
-  volatile uint32_t FUNCTION0;              /*!< Offset: 0x028 (R/W)  Function Register 0 */
-           uint32_t RESERVED0[1];
-  volatile uint32_t COMP1;                  /*!< Offset: 0x030 (R/W)  Comparator Register 1 */
-  volatile uint32_t MASK1;                  /*!< Offset: 0x034 (R/W)  Mask Register 1 */
-  volatile uint32_t FUNCTION1;              /*!< Offset: 0x038 (R/W)  Function Register 1 */
-           uint32_t RESERVED1[1];
-} DWT_Type;
-
-#define DWT ((DWT_Type *)0xE0001000)
-DWT_Type *dwt = DWT;
-
-void dwt0_configure(volatile void *addr) {
-    dwt->COMP0 = (uint32_t)addr;
-    dwt->MASK0 = 0;
-}
-
-enum DWT_Function {
-    DWT_R = 5,
-    DWT_W = 6,
-    DWT_RW = 7
-};
-
-void dwt0_enable(enum DWT_Function function) {
-    dwt->FUNCTION0 = function;
-}
-
-/* Wait for about 0.2us */
-static void tick(void) {
-                    /* 1 */         /* 2 */         /* 3 */         /* 4 */         /* 5 */
-    /*  5 */ __asm__("nop"); __asm__("nop"); __asm__("nop"); __asm__("nop"); __asm__("nop");
-    /* 10 */ __asm__("nop"); __asm__("nop"); __asm__("nop"); __asm__("nop"); __asm__("nop");
-}
-
-void spi_send(int data) {
-    SPI1->DR = data;
-    while (SPI1->SR & SPI_SR_BSY);
-}
-
-void strobe_aux(void) {
-    GPIOA->BSRR = GPIO_BSRR_BS_10;
-    tick();
-    GPIOA->BSRR = GPIO_BSRR_BR_10;
-}
-
-void strobe_leds(void) {
-    GPIOA->BSRR = GPIO_BSRR_BS_9;
-    tick();
-    GPIOA->BSRR = GPIO_BSRR_BR_9;
-}
-
+/* Things used for module status reporting. */
 #define FIRMWARE_VERSION 2
 #define HARDWARE_VERSION 4
 
@@ -97,6 +33,18 @@ volatile uint16_t adc_buf[2];
 volatile unsigned int sys_time = 0;
 volatile unsigned int sys_time_seconds = 0;
 
+/* Error counters for debugging */
+static unsigned int uart_overruns = 0;
+static unsigned int frame_overruns = 0;
+static unsigned int invalid_frames = 0;
+
+/* Status LED control */
+#define LED_STRETCHING_MS 50
+static volatile int error_led_timeout = 0;
+static volatile int comm_led_timeout = 0;
+static volatile int id_led_timeout = 0;
+
+/* Modulation data */
 volatile struct framebuf fb[2] = {0};
 volatile struct framebuf *read_fb=fb+0, *write_fb=fb+1;
 volatile int led_state = 0;
@@ -108,44 +56,12 @@ volatile union {
     uint32_t mac_data;
 } rx_buf;
 
+/* Auxiliary shift register values */
 #define LED_COMM     0x0001
 #define LED_ERROR    0x0002
 #define LED_ID       0x0004
 #define SR_ILED_HIGH 0x0080
 #define SR_ILED_LOW  0x0040
-
-unsigned int stk_start(void) {
-    return SysTick->VAL;
-}
-
-unsigned int stk_end(unsigned int start) {
-    return (start - SysTick->VAL) & 0xffffff;
-}
-
-unsigned int stk_microseconds(void) {
-    return sys_time*1000 + (1000 - (SysTick->VAL / (SystemCoreClock/1000000)));
-}
-
-void cfg_spi1() {
-    /* Configure SPI controller */
-    SPI1->I2SCFGR = 0;
-    SPI1->CR2 &= ~SPI_CR2_DS_Msk;
-    SPI1->CR2 &= ~SPI_CR2_DS_Msk;
-    SPI1->CR2 |= LL_SPI_DATAWIDTH_16BIT;
-
-    /* Baud rate PCLK/4 -> 12.5MHz */
-    SPI1->CR1 =
-          SPI_CR1_BIDIMODE
-        | SPI_CR1_BIDIOE
-        | SPI_CR1_SSM
-        | SPI_CR1_SSI
-        | SPI_CR1_SPE
-        | (1<<SPI_CR1_BR_Pos)
-        | SPI_CR1_MSTR
-        | SPI_CR1_CPOL
-        | SPI_CR1_CPHA;
-    /* FIXME maybe try w/o BIDI */
-}
 
 /* This is a lookup table mapping segments to present a standard segment order on the UART interface. This is converted
  * into an internal representation once on startup in main(). The data type must be at least uint16. */
@@ -287,6 +203,7 @@ void cfg_timers_led() {
 }
 
 void TIM1_CC_IRQHandler() {
+    //static int last_frame_time = 0;
     /* This handler takes about 1.5us */
     GPIOA->BSRR = GPIO_BSRR_BS_0; // Debug
 
@@ -299,11 +216,6 @@ void TIM1_CC_IRQHandler() {
     if (active_segment == NSEGMENTS) {
         active_segment = 0;
 
-        /* FIXME remove this?
-        int time = stk_microseconds();
-        frame_duration_us = time - last_frame_time;
-        last_frame_time = time;
-        */
         /* Frame buffer swap */
         if (fb_op == FB_UPDATE) {
             volatile struct framebuf *tmp = read_fb;
@@ -318,6 +230,8 @@ void TIM1_CC_IRQHandler() {
     /* Send AUX register data */
     uint32_t aux_reg = (read_fb->brightness ? SR_ILED_HIGH : SR_ILED_LOW) | (led_state<<1);
     SPI1->DR = aux_reg | segment_map[active_segment];
+
+    /* TODO: Measure frame rate for status report */
 
     /* Clear interrupt flag */
     TIM1->SR &= ~TIM_SR_CC1IF_Msk;
@@ -355,6 +269,27 @@ void TIM3_IRQHandler() {
     GPIOA->BSRR = GPIO_BSRR_BR_0; // Debug
 }
 
+void cfg_spi1() {
+    /* Configure SPI controller */
+    SPI1->I2SCFGR = 0;
+    SPI1->CR2 &= ~SPI_CR2_DS_Msk;
+    SPI1->CR2 &= ~SPI_CR2_DS_Msk;
+    SPI1->CR2 |= LL_SPI_DATAWIDTH_16BIT;
+
+    /* Baud rate PCLK/4 -> 12.5MHz */
+    SPI1->CR1 =
+          SPI_CR1_BIDIMODE
+        | SPI_CR1_BIDIOE
+        | SPI_CR1_SSM
+        | SPI_CR1_SSI
+        | SPI_CR1_SPE
+        | (1<<SPI_CR1_BR_Pos)
+        | SPI_CR1_MSTR
+        | SPI_CR1_CPOL
+        | SPI_CR1_CPHA;
+    /* FIXME maybe try w/o BIDI */
+}
+
 void uart_config(void) {
     USART1->CR1 = /* 8-bit -> M1, M0 clear */
         /* RTOIE clear */
@@ -383,11 +318,6 @@ void uart_config(void) {
     NVIC_SetPriority(USART1_IRQn, 1);
 }
 
-#define LED_STRETCHING_MS 50
-static volatile int error_led_timeout = 0;
-static volatile int comm_led_timeout = 0;
-static volatile int id_led_timeout = 0;
-
 void trigger_error_led() {
     error_led_timeout = LED_STRETCHING_MS;
 }
@@ -399,11 +329,6 @@ void trigger_comm_led() {
 void trigger_id_led() {
     id_led_timeout = LED_STRETCHING_MS;
 }
-
-/* Error counters for debugging */
-static unsigned int uart_overruns = 0;
-static unsigned int frame_overruns = 0;
-static unsigned int invalid_frames = 0;
 
 void tx_char(uint8_t c) {
     while (!(USART1->ISR & USART_ISR_TC));
@@ -761,7 +686,7 @@ int main(void) {
     /* Clear frame buffer */
     read_fb->brightness = 1;
     for (int i=0; i<sizeof(read_fb->data)/sizeof(uint32_t); i++) {
-        read_fb->data[i] = 0xffffffff; /* FIXME DEBUG 0x00000000; */
+        read_fb->data[i] = 0xffffffff; /* FIXME this is a debug value. Should be 0x00000000; */
     }
 
     cfg_timers_led();

@@ -15,6 +15,7 @@ enum {
     FRAME_SIZE_WORDS = NROWS*NCOLS*NSEGMENTS/32,
 };
 
+/* Framebuffer data format pre-formatted for BCM ISRs */
 struct framebuf {
     /* Multiplexing order: first Digits, then Time/bits, last Segments */
     union {
@@ -28,6 +29,7 @@ struct framebuf {
     uint8_t brightness; /* 0 or 1; controls global brighntess control */
 };
 
+/* Efficiently-packed UART data format */
 struct data_format {
     union {
         uint8_t high[8];

@@ -62,6 +62,7 @@ def send_framebuffer(ser, mac, frame):
 def discover_macs(ser, count=20):
     found_macs = []
     while True:
+        ser.flushInput()
         ser.write(b'\0')
         frame = receive_frame(ser)
         if len(frame) == 4:
@@ -77,6 +78,8 @@ def discover_macs(ser, count=20):
 
 def parse_status_frame(frame):
     print('frame len:', len(frame))
+    if not frame:
+        return None
     (   firmware_version, 
         hardware_version, 
         digit_rows, 
@@ -112,24 +115,26 @@ if __name__ == '__main__':
     frame_len = 4*8*8
     black, red = [0]*frame_len, [255]*frame_len
     frames = \
-            [black]*10 +\
-            [red]*10 +\
-            [[i]*frame_len for i in range(256)] +\
-            [[(i + (d//8)*8) % 256*8 for d in range(frame_len)] for i in range(256)]
+            [black]
+            #[[0]*i + [255]*(256-i) for i in range(257)]
+            #[[(i + d)%256 for d in range(frame_len)] for i in range(256)]
+            #[black]*10 +\
+            #[red]*10 +\
+            #[[i]*frame_len for i in range(256)] +\
+            #[[(i + (d//8)*8) % 256*8 for d in range(frame_len)] for i in range(256)]
 
     #frames = [red, black]*5
     #frames = [ x for l in [[([0]*i+[255]+[0]*(7-i))*32]*2 for i in range(8)] for x in l ]
-    found_macs = discover_macs(ser, 1)
+    found_macs = [0xdeadbeef] #discover_macs(ser, 1)
     mac, = found_macs
 
     import pprint
     while True:
-        pprint.pprint(fetch_status(ser, mac))
-        time.sleep(0.02)
-
-    while True:
+        try:
+            pprint.pprint(fetch_status(ser, mac))
+        except e:
+            print(e)
         for i, frame in enumerate(frames):
             send_framebuffer(ser, mac, frame)
-            print('sending', i, len(frame))
-            time.sleep(0.02)
+            time.sleep(0.1)
         # to produce framing errors: ser.write(b'\02a\0')
