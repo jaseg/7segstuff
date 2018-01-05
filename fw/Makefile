@@ -1,9 +1,9 @@
-# put your *.o targets here, make should handle the rest!
-CMSIS_PATH 		?= STM32Cube/Drivers/CMSIS
+CUBE_PATH 		?= $(wildcard ~)/resource/STM32CubeF0
+CMSIS_PATH 		?= $(CUBE_PATH)/Drivers/CMSIS
 CMSIS_DEV_PATH  ?= $(CMSIS_PATH)/Device/ST/STM32F0xx
-HAL_PATH   		?= STM32Cube/Drivers/STM32F0xx_HAL_Driver
+HAL_PATH   		?= $(CUBE_PATH)/Drivers/STM32F0xx_HAL_Driver
 
-BUS_ADDR        ?= 0
+MAC_ADDR        ?= 0xdeadbeef
 
 CC      := arm-none-eabi-gcc
 LD      := arm-none-eabi-ld
@@ -11,7 +11,7 @@ OBJCOPY := arm-none-eabi-objcopy
 OBJDUMP := arm-none-eabi-objdump
 SIZE    := arm-none-eabi-size
 
-CFLAGS  = -g -Wall -std=gnu11 -O0 -fdump-rtl-expand -DBUS_ADDR=$(BUS_ADDR)
+CFLAGS  = -g -Wall -std=gnu11 -O0 -fdump-rtl-expand -DMAC_ADDR=$(MAC_ADDR)
 CFLAGS += -mlittle-endian -mcpu=cortex-m0 -march=armv6-m -mthumb
 #CFLAGS += -ffunction-sections -fdata-sections
 LDFLAGS = -nostartfiles
@@ -32,12 +32,12 @@ LDFLAGS += -L$(CMSIS_PATH)/Lib/GCC -larm_cortexM0l_math
 
 ###################################################
 
-.PHONY: program clean bus_addr.c
+.PHONY: program clean
 
 all: main.elf
 
 cmsis_exports.c: $(CMSIS_DEV_PATH)/Include/stm32f030x6.h $(CMSIS_PATH)/Include/core_cm0.h
-	python3 gen_cmsis_exports.py $^ > $@
+	python3 tools/gen_cmsis_exports.py $^ > $@
 
 %.o: %.c
 	$(CC) -c $(CFLAGS) -o $@ $^
@@ -61,7 +61,7 @@ sources.c: sources.tar.xz.zip
 	xxd -i $< | head -n -1 | sed 's/=/__attribute__((section(".source_tarball"))) =/' > $@
 
 # FIXME re-add sources.o
-main.elf: main.o startup_stm32f030x6.o system_stm32f0xx.o $(HAL_PATH)/Src/stm32f0xx_ll_utils.o base.o cmsis_exports.o transpose.o bus_addr.o mac.o
+main.elf: main.o startup_stm32f030x6.o system_stm32f0xx.o $(HAL_PATH)/Src/stm32f0xx_ll_utils.o base.o cmsis_exports.o transpose.o mac.o
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LIBS)
 	$(OBJCOPY) -O ihex $@ $(@:.elf=.hex)
 	$(OBJCOPY) -O binary $@ $(@:.elf=.bin)
@@ -71,12 +71,12 @@ main.elf: main.o startup_stm32f030x6.o system_stm32f0xx.o $(HAL_PATH)/Src/stm32f
 program: main.elf openocd.cfg
 	openocd -f openocd.cfg -c "program $< verify reset exit"
 
-transpose.elf: transpose.c transpose_main.c
+tools/transpose_test: transpose.c tools/transpose_test.c
 	gcc -g -Wall -Wpedantic -o $@ $^
 
-.PHONY: transpose_test
-transpose_test: transpose.elf
-	./transpose.elf
+.PHONY: run_transpose_test
+run_transpose_test: tools/transpose_test
+	tools/transpose_test
 
 _crc.so: crc.c
 	gcc -o $@ -shared -fPIC -g $^
@@ -87,6 +87,9 @@ clean:
 	rm -f **.expand
 	rm -f transpose.elf
 	rm -f crc.so
+	rm -f cmsis_exports.c
 	rm -f sources.tar.xz
+	rm -f sources.tar.xz.zip
 	rm -f sources.c
+	rm -f *.dot
 

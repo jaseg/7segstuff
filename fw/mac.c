@@ -1,3 +1,3 @@
 #include "mac.h"
 
-uint32_t device_mac = 0xdeadbeef;
+uint32_t device_mac = MAC_ADDR;
