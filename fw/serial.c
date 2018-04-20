@@ -43,7 +43,7 @@ void serial_init() {
         | USART_CR1_RE;
     //USART1->CR2 = USART_CR2_RTOEN; /* Timeout enable */
     USART1->CR3 = USART_CR3_DEM; /* RS485 DE enable (output on RTS) */
-    /* Set divider for 25MHz baud rate @50MHz system clock. */
+    /* Set divider for 2MHz baud rate @50MHz system clock. */
     int usartdiv = 25;
     USART1->BRR = usartdiv;
 
