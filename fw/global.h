@@ -45,4 +45,6 @@
 extern volatile unsigned int sys_time;
 extern volatile unsigned int sys_time_seconds;
 
+extern volatile unsigned int comm_led_ctr, err_led_ctr;
+
 #endif/*__GLOBAL_H__*/
